@@ -81,6 +81,12 @@ CONFIRM_BULK = resource_path(
     os.path.join("templates", "confirm_bulk.png")
 )
 
+# Pattern thứ 2 cho nút "Xác nhận" khi popup Mua thất bại
+# hiển thị nút đậm hơn.
+CONFIRM_BULK_BOLD = resource_path(
+    os.path.join("templates", "confirm_bulk_bold.png")
+)
+
 FAILURE = resource_path(
     os.path.join("templates", "fco_failure_title.png")
 )
@@ -338,75 +344,153 @@ def click_client(
 # TYPE VALUE INTO FC ONLINE INPUT
 # ============================================================
 
-def key_press(hwnd, vk, char=None):
-    """Gửi một phím trực tiếp vào FC Online, không di chuyển chuột vật lý."""
-    win32gui.SendMessage(
-        hwnd,
-        win32con.WM_KEYDOWN,
-        vk,
-        0
-    )
+# ============================================================
+# FAILURE CONFIRM BUTTON
+# ============================================================
 
-    if char is not None:
-        win32gui.SendMessage(
-            hwnd,
-            win32con.WM_CHAR,
-            ord(char),
-            0
+def click_failure_confirm(
+    hwnd,
+    confirm_template,
+    confirm_template_bold,
+    threshold,
+    stop_event=None,
+    log_callback=None
+):
+    """
+    Xử lý nút 'Xác nhận' trên popup Mua thất bại.
+
+    Check đồng thời 2 pattern:
+      1. confirm_bulk.png
+      2. confirm_bulk_bold.png
+
+    Chỉ cần một pattern đạt threshold là xem như tìm thấy nút.
+    """
+
+    # --------------------------------------------------------
+    # Check 2 template liên tục trong thời gian ngắn.
+    # --------------------------------------------------------
+
+    end_time = time.time() + 1.5
+
+    while time.time() < end_time:
+
+        if (
+            stop_event is not None
+            and stop_event.is_set()
+        ):
+            return False
+
+        try:
+            screen = capture_fco(hwnd)
+
+            # Pattern 1 - nút bình thường
+            normal_conf, normal_x, normal_y = find_template(
+                screen,
+                confirm_template
+            )
+
+            # Pattern 2 - nút đậm
+            bold_conf = 0.0
+            bold_x = 0
+            bold_y = 0
+
+            if confirm_template_bold is not None:
+                bold_conf, bold_x, bold_y = find_template(
+                    screen,
+                    confirm_template_bold
+                )
+
+            # Chọn pattern tốt nhất.
+            if bold_conf > normal_conf:
+                best_conf = bold_conf
+                best_x = bold_x
+                best_y = bold_y
+                best_pattern = "confirm_bulk_bold.png"
+            else:
+                best_conf = normal_conf
+                best_x = normal_x
+                best_y = normal_y
+                best_pattern = "confirm_bulk.png"
+
+            if best_conf >= threshold:
+
+                log_message(
+                    f"✅ Xác nhận thất bại "
+                    f"(pattern={best_pattern}, "
+                    f"confidence={best_conf:.4f})",
+                    log_callback
+                )
+
+                click_client(
+                    hwnd,
+                    best_x,
+                    best_y,
+                    method="send"
+                )
+
+                return True
+
+        except Exception as exc:
+
+            log_message(
+                f"⚠️ Lỗi check 2 pattern Xác nhận: {exc}",
+                log_callback
+            )
+
+        random_sleep(
+            0.04,
+            0.06
         )
 
-    win32gui.SendMessage(
-        hwnd,
-        win32con.WM_KEYUP,
-        vk,
-        0
-    )
+    # --------------------------------------------------------
+    # Fallback nếu cả 2 template đều không match.
+    # Popup thất bại đã được nhận diện ở Step 3,
+    # nên nút Xác nhận nằm ở vị trí tương đối ổn định.
+    # --------------------------------------------------------
 
+    try:
 
-def select_all_input(hwnd):
-    """Ctrl+A cho ô input đang được focus."""
-    win32gui.SendMessage(
-        hwnd,
-        win32con.WM_KEYDOWN,
-        win32con.VK_CONTROL,
-        0
-    )
+        left, top, right, bottom = win32gui.GetClientRect(hwnd)
 
-    win32gui.SendMessage(
-        hwnd,
-        win32con.WM_KEYDOWN,
-        ord("A"),
-        0
-    )
+        width = right - left
+        height = bottom - top
 
-    win32gui.SendMessage(
-        hwnd,
-        win32con.WM_KEYUP,
-        ord("A"),
-        0
-    )
+        x = int(width * 0.561)
+        y = int(height * 0.604)
 
-    win32gui.SendMessage(
-        hwnd,
-        win32con.WM_KEYUP,
-        win32con.VK_CONTROL,
-        0
-    )
+        log_message(
+            "⚠️ Cả 2 pattern Xác nhận không match "
+            f"→ fallback click ({x},{y})",
+            log_callback
+        )
 
+        click_client(
+            hwnd,
+            x,
+            y,
+            method="send"
+        )
 
-def type_text(hwnd, text):
-    for char in str(text):
-        if char.isdigit():
-            vk = ord(char)
-            key_press(hwnd, vk, char)
+        random_sleep(
+            0.10,
+            0.16
+        )
 
-        elif char == ".":
-            key_press(hwnd, 0xBE, char)
+        log_message(
+            "✅ Đã gửi click Xác nhận fallback.",
+            log_callback
+        )
 
-        else:
-            key_press(hwnd, ord(char.upper()), char)
+        return True
 
-        random_sleep(0.02, 0.04)
+    except Exception as exc:
+
+        log_message(
+            f"❌ Fallback click Xác nhận thất bại lỗi: {exc}",
+            log_callback
+        )
+
+        return False
 
 
 # ============================================================
@@ -972,6 +1056,25 @@ def run_auto_buy(
             CONFIRM_BULK
         )
 
+        try:
+            confirm_bulk_bold = load_template(
+                CONFIRM_BULK_BOLD
+            )
+
+            log_message(
+                "✅ Đã load pattern Xác nhận đậm.",
+                log_callback
+            )
+
+        except Exception:
+            confirm_bulk_bold = None
+
+            log_message(
+                "⚠️ Không có confirm_bulk_bold.png "
+                "→ chỉ dùng pattern thường.",
+                log_callback
+            )
+
         failure = load_template(
             FAILURE
         )
@@ -1000,6 +1103,11 @@ def run_auto_buy(
         log_callback
     )
 
+    log_message(
+        "🔎 Xác nhận thất bại: check 2 pattern.",
+        log_callback
+    )
+
 
     # ========================================================
     # PLAYER COUNTER
@@ -1007,7 +1115,7 @@ def run_auto_buy(
 
     purchased_players = 0
 
-
+    # --------------------------------------------------------
     if player_count_callback is not None:
 
         player_count_callback(
@@ -1393,32 +1501,21 @@ def run_auto_buy(
             )
 
 
-            result = wait_for_template(
+            confirmed = click_failure_confirm(
                 hwnd,
                 confirm_bulk,
-                timeout=5,
-                threshold=threshold,
-                stop_event=stop_event
+                confirm_bulk_bold,
+                threshold,
+                stop_event=stop_event,
+                log_callback=log_callback
             )
 
-
-            if result is None:
-
+            if not confirmed:
                 log_message(
-                    "❌ Không tìm thấy "
-                    "Xác nhận thất bại.",
+                    "❌ Không thể xác nhận popup thất bại.",
                     log_callback
                 )
-
                 break
-
-
-            click_client(
-                hwnd,
-                result["x"],
-                result["y"],
-                method="send"
-            )
 
 
             log_message(

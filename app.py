@@ -782,21 +782,6 @@ sidebar_item(
 
 ctk.CTkLabel(
     sidebar,
-    text="GOOD\nPLAYERS\nBETTER\nTRADES",
-    justify="center",
-    text_color="#45525C",
-    font=ctk.CTkFont(
-        size=7,
-        weight="bold"
-    )
-).pack(
-    side="bottom",
-    pady=(0, 22)
-)
-
-
-ctk.CTkLabel(
-    sidebar,
     text="v1.0.0",
     text_color="#58656F",
     font=ctk.CTkFont(
@@ -1441,32 +1426,6 @@ footer.pack(
 
 footer.pack_propagate(
     False
-)
-
-
-ctk.CTkLabel(
-    footer,
-    text="FC ONLINE AUTO BUY",
-    text_color="#52606A",
-    font=ctk.CTkFont(
-        size=8,
-        weight="bold"
-    )
-).pack(
-    side="left"
-)
-
-
-ctk.CTkLabel(
-    footer,
-    text="MAKE EVERY OPPORTUNITY COUNT",
-    text_color="#52606A",
-    font=ctk.CTkFont(
-        size=8,
-        weight="bold"
-    )
-).pack(
-    side="right"
 )
 
 
