@@ -41,6 +41,7 @@ def random_sleep(min_seconds, max_seconds):
 # ============================================================
 
 import os
+import ctypes
 import sys
 
 
@@ -343,6 +344,370 @@ def click_client(
 # ============================================================
 # TYPE VALUE INTO FC ONLINE INPUT
 # ============================================================
+
+
+# ============================================================
+# KEYBOARD INPUT / FILTER SETUP
+# ============================================================
+
+def _key_lparam(vk, key_up=False):
+    """
+    Tạo lParam đầy đủ cho WM_KEYDOWN/WM_KEYUP:
+    repeat count + scan code + extended flag + key state.
+    """
+    scan = win32api.MapVirtualKey(vk, 0)
+
+    # Delete (0x2E) và Page Down (0x22) là phím extended.
+    extended = 1 if vk in (
+        win32con.VK_DELETE,
+        win32con.VK_NEXT
+    ) else 0
+
+    value = (
+        1
+        | (scan << 16)
+        | (extended << 24)
+    )
+
+    if key_up:
+        value |= 0xC0000000
+
+    return ctypes.c_long(value).value
+
+
+def key_press(hwnd, vk, char=None):
+    """
+    Gửi phím với scan-code/lParam đầy đủ.
+    Quan trọng với FC Online vì chỉ truyền VK + lParam=0
+    có thể khiến Delete/Page Down bị game bỏ qua.
+    """
+    down_lparam = _key_lparam(
+        vk,
+        key_up=False
+    )
+
+    up_lparam = _key_lparam(
+        vk,
+        key_up=True
+    )
+
+    win32gui.SendMessage(
+        hwnd,
+        win32con.WM_KEYDOWN,
+        vk,
+        down_lparam
+    )
+
+    random_sleep(
+        0.03,
+        0.05
+    )
+
+    if char is not None:
+        win32gui.SendMessage(
+            hwnd,
+            win32con.WM_CHAR,
+            ord(char),
+            0
+        )
+
+    random_sleep(
+        0.02,
+        0.04
+    )
+
+    win32gui.SendMessage(
+        hwnd,
+        win32con.WM_KEYUP,
+        vk,
+        up_lparam
+    )
+
+
+def select_all_input(hwnd):
+    """Chọn toàn bộ nội dung của ô đang được focus."""
+    win32gui.SendMessage(
+        hwnd,
+        win32con.WM_KEYDOWN,
+        win32con.VK_CONTROL,
+        0
+    )
+
+    random_sleep(0.02, 0.04)
+
+    win32gui.SendMessage(
+        hwnd,
+        win32con.WM_KEYDOWN,
+        ord("A"),
+        0
+    )
+
+    win32gui.SendMessage(
+        hwnd,
+        win32con.WM_KEYUP,
+        ord("A"),
+        0
+    )
+
+    win32gui.SendMessage(
+        hwnd,
+        win32con.WM_KEYUP,
+        win32con.VK_CONTROL,
+        0
+    )
+
+
+def type_text(hwnd, text):
+    """Nhập chuỗi ký tự vào ô đang focus."""
+    for char in str(text):
+        if char.isdigit():
+            key_press(hwnd, ord(char), char)
+        elif char == ".":
+            key_press(hwnd, 0xBE, char)
+        elif char == ",":
+            key_press(hwnd, 0xBC, char)
+        else:
+            key_press(hwnd, ord(char.upper()), char)
+
+        random_sleep(0.02, 0.035)
+
+
+# Tọa độ theo ảnh FC Online 1280x752 hiện tại.
+# Đây là tọa độ trên screenshot full window, giống các template.
+STAT_MIN_X = 960
+STAT_MIN_Y = 326
+
+STAT_MAX_X = 1055
+STAT_MAX_Y = 326
+
+MAX_CARD_PRICE_X = 986
+MAX_CARD_PRICE_Y = 449
+
+
+
+def double_click_input(hwnd, image_x, image_y):
+    """
+    Double-click vào ô nhập bằng SendMessage.
+    Không di chuyển chuột vật lý.
+    """
+    left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+    client_left, client_top = win32gui.ClientToScreen(hwnd, (0, 0))
+
+    client_x = int(image_x - (client_left - left))
+    client_y = int(image_y - (client_top - top))
+
+    lparam = win32api.MAKELONG(
+        client_x,
+        client_y
+    )
+
+    win32gui.SendMessage(
+        hwnd,
+        win32con.WM_LBUTTONDOWN,
+        win32con.MK_LBUTTON,
+        lparam
+    )
+
+    random_sleep(0.05, 0.08)
+
+    win32gui.SendMessage(
+        hwnd,
+        win32con.WM_LBUTTONUP,
+        0,
+        lparam
+    )
+
+    random_sleep(0.05, 0.08)
+
+    win32gui.SendMessage(
+        hwnd,
+        win32con.WM_LBUTTONDOWN,
+        win32con.MK_LBUTTON,
+        lparam
+    )
+
+    random_sleep(0.05, 0.08)
+
+    win32gui.SendMessage(
+        hwnd,
+        win32con.WM_LBUTTONUP,
+        0,
+        lparam
+    )
+
+
+def set_filter_by_double_click(
+    hwnd,
+    image_x,
+    image_y,
+    value,
+    label,
+    log_callback=None
+):
+    """
+    Click đúp vào ô -> nhập giá trị -> Enter.
+    Không Page Down / không Delete.
+    """
+    log_message(
+        f"    🖱️ Click đúp ô '{label}'...",
+        log_callback
+    )
+
+    double_click_input(
+        hwnd,
+        image_x,
+        image_y
+    )
+
+    random_sleep(
+        0.08,
+        0.12
+    )
+
+    log_message(
+        f"    ⌨️ Nhập '{value}' vào '{label}'...",
+        log_callback
+    )
+
+    type_text(
+        hwnd,
+        str(value)
+    )
+
+    random_sleep(
+        0.05,
+        0.08
+    )
+
+    key_press(
+        hwnd,
+        win32con.VK_RETURN,
+        "\r"
+    )
+
+    random_sleep(
+        0.10,
+        0.15
+    )
+
+
+def set_purchase_filters(
+    hwnd,
+    stat_min,
+    stat_max,
+    max_card_price,
+    log_callback=None
+):
+    """
+    Flow:
+      1. Double-click Chỉ số MIN -> nhập MIN
+      2. Double-click Chỉ số MAX -> nhập MAX
+      3. Nhập giá tối đa mỗi thẻ
+      4. Quay về flow Mua hàng loạt
+    """
+
+    log_message(
+        "⚙️ Đang thiết lập bộ lọc mua hàng...",
+        log_callback
+    )
+
+    # 1. MIN
+    set_filter_by_double_click(
+        hwnd,
+        STAT_MIN_X,
+        STAT_MIN_Y,
+        stat_min,
+        "Chỉ số MIN",
+        log_callback
+    )
+
+    # 2. MAX
+    set_filter_by_double_click(
+        hwnd,
+        STAT_MAX_X,
+        STAT_MAX_Y,
+        stat_max,
+        "Chỉ số MAX",
+        log_callback
+    )
+
+    # 3. Giá tối đa mỗi thẻ
+    set_filter_by_double_click(
+        hwnd,
+        MAX_CARD_PRICE_X,
+        MAX_CARD_PRICE_Y,
+        max_card_price,
+        "Giá tối đa mỗi thẻ",
+        log_callback
+    )
+
+    log_message(
+        f"✅ Đã điền filter: MIN={stat_min} | "
+        f"MAX={stat_max} | "
+        f"Giá/thẻ={max_card_price:,}",
+        log_callback
+    )
+
+
+
+def set_purchase_filters(
+    hwnd,
+    stat_min,
+    stat_max,
+    max_card_price,
+    log_callback=None
+):
+    """
+    Thiết lập:
+      - Chỉ số min
+      - Chỉ số max
+      - Giá trị tối đa mỗi thẻ
+
+    Chỉ thực hiện một lần trước Step 1.
+    """
+
+    log_message(
+        "⚙️ Đang thiết lập bộ lọc mua hàng...",
+        log_callback
+    )
+
+    log_message(
+        "🧹 Click ô Chỉ số → DELETE → nhập MIN/MAX.",
+        log_callback
+    )
+
+    set_filter_by_double_click(
+        hwnd,
+        STAT_MIN_X,
+        STAT_MIN_Y,
+        stat_min,
+        "Chỉ số MIN",
+        log_callback
+    )
+
+    set_filter_by_double_click(
+        hwnd,
+        STAT_MAX_X,
+        STAT_MAX_Y,
+        stat_max,
+        "Chỉ số MAX",
+        log_callback
+    )
+
+    set_filter_by_double_click(
+        hwnd,
+        MAX_CARD_PRICE_X,
+        MAX_CARD_PRICE_Y,
+        max_card_price,
+        "Giá tối đa mỗi thẻ",
+        log_callback
+    )
+
+    log_message(
+        f"✅ Bộ lọc: MIN={stat_min} | MAX={stat_max} | "
+        f"Giá/thẻ={max_card_price:,}",
+        log_callback
+    )
 
 # ============================================================
 # FAILURE CONFIRM BUTTON
@@ -1017,6 +1382,9 @@ def run_auto_buy(
     hwnd,
     target_players,
     threshold,
+    stat_min,
+    stat_max,
+    max_card_price,
     stop_event=None,
     log_callback=None,
     player_count_callback=None
@@ -1107,6 +1475,26 @@ def run_auto_buy(
         "🔎 Xác nhận thất bại: check 2 pattern.",
         log_callback
     )
+
+    # ========================================================
+    # STEP 0
+    # SET PURCHASE FILTERS
+    # ========================================================
+
+    try:
+        set_purchase_filters(
+            hwnd,
+            stat_min,
+            stat_max,
+            max_card_price,
+            log_callback=log_callback
+        )
+    except Exception as exc:
+        log_message(
+            f"❌ Không thể thiết lập bộ lọc mua hàng: {exc}",
+            log_callback
+        )
+        return
 
 
     # ========================================================

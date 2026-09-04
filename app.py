@@ -5,6 +5,8 @@ import ctypes
 import os
 import sys
 import time
+import json
+import re
 
 from PIL import Image, ImageTk
 
@@ -20,7 +22,7 @@ ctk.set_default_color_theme("green")
 
 APP_TITLE = "FC ONLINE AUTO BUY"
 APP_WIDTH = 460
-APP_HEIGHT = 660
+APP_HEIGHT = 760
 
 BG = "#080D11"
 INNER_COLOR = "#0B1217"
@@ -69,6 +71,9 @@ def resource_path(relative_path):
         relative_path
     )
 
+
+PROFILE_FILE = resource_path("profiles.json")
+profiles = {}
 
 ICON_PATH = resource_path("icon.png")
 
@@ -262,6 +267,9 @@ def bot_worker(
     hwnd,
     target_players,
     threshold,
+    stat_min,
+    stat_max,
+    max_card_price,
     current_stop_event
 ):
 
@@ -285,6 +293,10 @@ def bot_worker(
             f"Mục tiêu: {target_players} cầu thủ"
         )
 
+        add_log(
+            f"Filter: MIN={stat_min} | MAX={stat_max} | "
+            f"Giá/thẻ={max_card_price:,}"
+        )
 
         add_log(
             "----------------------------------------"
@@ -302,6 +314,9 @@ def bot_worker(
             hwnd=hwnd,
             target_players=target_players,
             threshold=threshold,
+            stat_min=stat_min,
+            stat_max=stat_max,
+            max_card_price=max_card_price,
             stop_event=current_stop_event,
             log_callback=add_log,
             player_count_callback=update_player_count
@@ -348,6 +363,206 @@ def bot_finished():
     update_status(
         "⚪ BOT: STOPPED"
     )
+
+
+
+# ============================================================
+# PROFILE MANAGEMENT
+# ============================================================
+
+def load_profiles():
+    global profiles
+
+    try:
+        if os.path.exists(PROFILE_FILE):
+            with open(
+                PROFILE_FILE,
+                "r",
+                encoding="utf-8"
+            ) as f:
+                data = json.load(f)
+
+            profiles = data if isinstance(data, dict) else {}
+        else:
+            profiles = {}
+
+    except Exception as exc:
+        profiles = {}
+        add_log(
+            f"⚠️ Không đọc được profiles.json: {exc}"
+        )
+
+
+def save_profiles():
+    try:
+        with open(
+            PROFILE_FILE,
+            "w",
+            encoding="utf-8"
+        ) as f:
+            json.dump(
+                profiles,
+                f,
+                ensure_ascii=False,
+                indent=2
+            )
+
+        return True
+
+    except Exception as exc:
+        add_log(
+            f"❌ Không lưu được profile: {exc}"
+        )
+        return False
+
+
+def refresh_profile_combo():
+    names = list(profiles.keys())
+
+    profile_combo.configure(
+        values=names
+    )
+
+    if names:
+        current = profile_combo.get()
+
+        if current not in names:
+            profile_combo.set(names[0])
+    else:
+        profile_combo.set("")
+
+
+def on_profile_selected(name):
+    data = profiles.get(name)
+
+    if not isinstance(data, dict):
+        return
+
+    stat_min_entry.delete(0, "end")
+    stat_min_entry.insert(
+        0,
+        str(data.get("stat_min", 97))
+    )
+
+    stat_max_entry.delete(0, "end")
+    stat_max_entry.insert(
+        0,
+        str(data.get("stat_max", 99))
+    )
+
+    max_price_entry.delete(0, "end")
+    max_price_entry.insert(
+        0,
+        f"{int(data.get('max_card_price', 10000)):,}"
+    )
+
+    add_log(
+        f"📁 Đã chọn profile: {name}"
+    )
+
+
+def save_current_profile():
+    name = profile_name_entry.get().strip()
+
+    if not name:
+        add_log(
+            "❌ Nhập tên profile trước."
+        )
+        return
+
+    try:
+        stat_min = int(
+            stat_min_entry.get().strip()
+        )
+
+        stat_max = int(
+            stat_max_entry.get().strip()
+        )
+
+        max_card_price = int(
+            re.sub(
+                r"[^\d]",
+                "",
+                max_price_entry.get()
+            )
+        )
+
+        if stat_min <= 0 or stat_max <= 0:
+            raise ValueError
+
+        if stat_min > stat_max:
+            add_log(
+                "❌ Chỉ số MIN không được lớn hơn MAX."
+            )
+            return
+
+        if max_card_price <= 0:
+            raise ValueError
+
+    except ValueError:
+        add_log(
+            "❌ MIN / MAX / Giá tối đa không hợp lệ."
+        )
+        return
+
+    profiles[name] = {
+        "stat_min": stat_min,
+        "stat_max": stat_max,
+        "max_card_price": max_card_price
+    }
+
+    if save_profiles():
+        refresh_profile_combo()
+        profile_combo.set(name)
+        add_log(
+            f"💾 Đã lưu profile '{name}'."
+        )
+
+
+def delete_current_profile():
+    name = profile_combo.get().strip()
+
+    if not name:
+        add_log(
+            "⚠️ Chưa chọn profile để xóa."
+        )
+        return
+
+    if name not in profiles:
+        add_log(
+            f"⚠️ Không tìm thấy profile '{name}'."
+        )
+        return
+
+    del profiles[name]
+
+    if save_profiles():
+        refresh_profile_combo()
+        profile_name_entry.delete(0, "end")
+
+        # Không xóa giá trị filter đang hiển thị,
+        # chỉ bỏ profile khỏi danh sách.
+        add_log(
+            f"🗑️ Đã xóa profile '{name}'."
+        )
+
+
+def format_price_entry(event=None):
+    value = re.sub(
+        r"[^\d]",
+        "",
+        max_price_entry.get()
+    )
+
+    formatted = (
+        f"{int(value):,}"
+        if value
+        else ""
+    )
+
+    if max_price_entry.get() != formatted:
+        max_price_entry.delete(0, "end")
+        max_price_entry.insert(0, formatted)
 
 
 # ============================================================
@@ -428,6 +643,45 @@ def start_bot():
         return
 
     # --------------------------------------------------------
+    # VALIDATE PURCHASE FILTERS
+    # --------------------------------------------------------
+
+    try:
+        stat_min = int(
+            stat_min_entry.get().strip()
+        )
+
+        stat_max = int(
+            stat_max_entry.get().strip()
+        )
+
+        max_card_price = int(
+            re.sub(
+                r"[^\d]",
+                "",
+                max_price_entry.get()
+            )
+        )
+
+        if stat_min <= 0 or stat_max <= 0:
+            raise ValueError
+
+        if stat_min > stat_max:
+            add_log(
+                "❌ Chỉ số MIN không được lớn hơn MAX."
+            )
+            return
+
+        if max_card_price <= 0:
+            raise ValueError
+
+    except ValueError:
+        add_log(
+            "❌ MIN / MAX / Giá tối đa không hợp lệ."
+        )
+        return
+
+    # --------------------------------------------------------
     # SETTINGS
     # --------------------------------------------------------
 
@@ -475,7 +729,11 @@ def start_bot():
         target=bot_worker,
         args=(
             hwnd,
-            target_players,            threshold,
+            target_players,
+            threshold,
+            stat_min,
+            stat_max,
+            max_card_price,
             stop_event
         ),
         daemon=True
@@ -919,7 +1177,7 @@ cards.grid_columnconfigure(
 
 
 # ============================================================
-# INPUT CARD
+# INPUT + PROFILE CARD
 # ============================================================
 
 input_card = ctk.CTkFrame(
@@ -928,7 +1186,7 @@ input_card = ctk.CTkFrame(
     border_width=1,
     border_color=BORDER,
     corner_radius=16,
-    height=96
+    height=190
 )
 
 input_card.grid(
@@ -938,9 +1196,7 @@ input_card.grid(
     sticky="ew"
 )
 
-input_card.grid_propagate(
-    False
-)
+input_card.grid_propagate(False)
 
 
 input_content = ctk.CTkFrame(
@@ -949,30 +1205,148 @@ input_content = ctk.CTkFrame(
 )
 
 input_content.pack(
-    fill="x",
+    fill="both",
+    expand=True,
     padx=14,
-    pady=(8, 0)
+    pady=10
 )
 
 
 # ============================================================
-# TARGET PLAYER INPUT
+# PROFILE ROW
 # ============================================================
 
-target_block = ctk.CTkFrame(
+profile_row = ctk.CTkFrame(
     input_content,
-    fg_color="transparent"
+    fg_color="transparent",
+    height=30
 )
 
-target_block.pack(
-    side="left",
-    fill="x",
-    expand=True
+profile_row.pack(
+    fill="x"
 )
+
+profile_row.pack_propagate(False)
 
 
 ctk.CTkLabel(
-    target_block,
+    profile_row,
+    text="PROFILE",
+    text_color=MUTED,
+    font=ctk.CTkFont(
+        size=8,
+        weight="bold"
+    )
+).pack(
+    side="left",
+    padx=(0, 7)
+)
+
+
+profile_combo = ctk.CTkComboBox(
+    profile_row,
+    width=120,
+    height=27,
+    fg_color=INNER_COLOR,
+    border_color="#3B4A55",
+    button_color="#18242C",
+    button_hover_color="#22323C",
+    text_color=TEXT,
+    font=ctk.CTkFont(
+        size=9
+    ),
+    values=[],
+    command=on_profile_selected
+)
+
+profile_combo.pack(
+    side="left"
+)
+
+
+profile_name_entry = ctk.CTkEntry(
+    profile_row,
+    width=100,
+    height=27,
+    fg_color=INNER_COLOR,
+    border_color="#3B4A55",
+    corner_radius=8,
+    text_color=TEXT,
+    placeholder_text="Tên profile",
+    font=ctk.CTkFont(
+        size=9
+    )
+)
+
+profile_name_entry.pack(
+    side="left",
+    padx=(6, 5)
+)
+
+
+save_profile_button = ctk.CTkButton(
+    profile_row,
+    text="Lưu",
+    width=42,
+    height=27,
+    corner_radius=8,
+    fg_color="#153F29",
+    hover_color="#1A5B3A",
+    text_color=GREEN,
+    font=ctk.CTkFont(
+        size=9,
+        weight="bold"
+    ),
+    command=save_current_profile
+)
+
+save_profile_button.pack(
+    side="left"
+)
+
+
+delete_profile_button = ctk.CTkButton(
+    profile_row,
+    text="Xóa",
+    width=42,
+    height=27,
+    corner_radius=8,
+    fg_color="#322020",
+    hover_color="#4D2B2B",
+    text_color=DANGER,
+    font=ctk.CTkFont(
+        size=9,
+        weight="bold"
+    ),
+    command=delete_current_profile
+)
+
+delete_profile_button.pack(
+    side="left",
+    padx=(5, 0)
+)
+
+
+# ============================================================
+# TARGET
+# ============================================================
+
+target_row = ctk.CTkFrame(
+    input_content,
+    fg_color="transparent",
+    height=31
+)
+
+target_row.pack(
+    fill="x",
+    pady=(4, 0)
+)
+
+target_row.pack_propagate(False)
+
+
+ctk.CTkLabel(
+    target_row,
     text="🛒  CẦU THỦ",
     text_color=TEXT,
     font=ctk.CTkFont(
@@ -980,46 +1354,162 @@ ctk.CTkLabel(
         weight="bold"
     )
 ).pack(
-    anchor="w"
-)
-
-
-ctk.CTkLabel(
-    target_block,
-    text="Số lượng cần mua",
-    text_color=MUTED,
-    font=ctk.CTkFont(
-        size=7
-    )
-).pack(
-    anchor="w",
-    pady=(1, 0)
+    side="left"
 )
 
 
 target_entry = ctk.CTkEntry(
-    target_block,
-    width=105,
-    height=30,
+    target_row,
+    width=85,
+    height=29,
     fg_color=INNER_COLOR,
     border_color="#3B4A55",
     border_width=1,
     corner_radius=8,
     text_color=TEXT,
     font=ctk.CTkFont(
-        size=13,
+        size=12,
         weight="bold"
     )
 )
 
 target_entry.pack(
-    anchor="w",
-    pady=(3, 0)
+    side="right"
 )
 
 target_entry.insert(
     0,
     "10"
+)
+
+
+# ============================================================
+# FILTERS
+# ============================================================
+
+filters_row = ctk.CTkFrame(
+    input_content,
+    fg_color="transparent"
+)
+
+filters_row.pack(
+    fill="x",
+    pady=(7, 0)
+)
+
+filters_row.grid_columnconfigure(
+    0,
+    weight=1
+)
+
+filters_row.grid_columnconfigure(
+    1,
+    weight=1
+)
+
+filters_row.grid_columnconfigure(
+    2,
+    weight=1
+)
+
+
+def create_filter_field(
+    parent,
+    column,
+    title,
+    default
+):
+    box = ctk.CTkFrame(
+        parent,
+        fg_color="transparent"
+    )
+
+    box.grid(
+        row=0,
+        column=column,
+        sticky="ew",
+        padx=(
+            0 if column == 0 else 4,
+            4 if column < 2 else 0
+        )
+    )
+
+    ctk.CTkLabel(
+        box,
+        text=title,
+        text_color=MUTED,
+        font=ctk.CTkFont(
+            size=7,
+            weight="bold"
+        )
+    ).pack(
+        anchor="w"
+    )
+
+    entry = ctk.CTkEntry(
+        box,
+        height=29,
+        fg_color=INNER_COLOR,
+        border_color="#3B4A55",
+        border_width=1,
+        corner_radius=8,
+        text_color=TEXT,
+        font=ctk.CTkFont(
+            size=10,
+            weight="bold"
+        )
+    )
+
+    entry.pack(
+        fill="x",
+        pady=(3, 0)
+    )
+
+    entry.insert(
+        0,
+        default
+    )
+
+    return entry
+
+
+stat_min_entry = create_filter_field(
+    filters_row,
+    0,
+    "CHỈ SỐ MIN",
+    "97"
+)
+
+stat_max_entry = create_filter_field(
+    filters_row,
+    1,
+    "CHỈ SỐ MAX",
+    "99"
+)
+
+max_price_entry = create_filter_field(
+    filters_row,
+    2,
+    "GIÁ TỐI ĐA / THẺ",
+    "10,000"
+)
+
+max_price_entry.bind(
+    "<FocusOut>",
+    format_price_entry
+)
+
+
+ctk.CTkLabel(
+    input_content,
+    text="Profile lưu MIN / MAX / giá tối đa để dùng lại lần sau",
+    text_color="#63717B",
+    font=ctk.CTkFont(
+        size=7
+    )
+).pack(
+    anchor="w",
+    pady=(7, 0)
 )
 
 
@@ -1427,6 +1917,14 @@ footer.pack(
 footer.pack_propagate(
     False
 )
+
+
+# ============================================================
+# LOAD SAVED PROFILES
+# ============================================================
+
+load_profiles()
+refresh_profile_combo()
 
 
 # ============================================================
