@@ -20,9 +20,9 @@ from auto_buy import run_auto_buy
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("green")
 
-APP_TITLE = "FC ONLINE AUTO BUY"
+APP_TITLE = "AUTO BUY FCO"
 APP_WIDTH = 460
-APP_HEIGHT = 760
+APP_HEIGHT = 660
 
 BG = "#080D11"
 INNER_COLOR = "#0B1217"
@@ -105,7 +105,7 @@ def find_fc_online():
 
         title = win32gui.GetWindowText(hwnd)
 
-        if title.strip().upper() == "FC ONLINE":
+        if title.strip().upper() == "":
             found_hwnd = hwnd
 
     win32gui.EnumWindows(
@@ -270,6 +270,7 @@ def bot_worker(
     stat_min,
     stat_max,
     max_card_price,
+    quantity,
     current_stop_event
 ):
 
@@ -317,6 +318,7 @@ def bot_worker(
             stat_min=stat_min,
             stat_max=stat_max,
             max_card_price=max_card_price,
+            quantity=quantity,
             stop_event=current_stop_event,
             log_callback=add_log,
             player_count_callback=update_player_count
@@ -487,7 +489,11 @@ def save_current_profile():
             )
         )
 
-        if stat_min <= 0 or stat_max <= 0:
+        quantity = int(
+            quantity_entry.get().strip()
+        )
+
+        if stat_min <= 0 or stat_max <= 0 or quantity <= 0:
             raise ValueError
 
         if stat_min > stat_max:
@@ -501,7 +507,7 @@ def save_current_profile():
 
     except ValueError:
         add_log(
-            "❌ MIN / MAX / Giá tối đa không hợp lệ."
+            "❌ MIN / MAX / Giá tối đa / Số lượng không hợp lệ."
         )
         return
 
@@ -663,7 +669,11 @@ def start_bot():
             )
         )
 
-        if stat_min <= 0 or stat_max <= 0:
+        quantity = int(
+            quantity_entry.get().strip()
+        )
+
+        if stat_min <= 0 or stat_max <= 0 or quantity <= 0:
             raise ValueError
 
         if stat_min > stat_max:
@@ -734,6 +744,7 @@ def start_bot():
             stat_min,
             stat_max,
             max_card_price,
+            quantity,
             stop_event
         ),
         daemon=True
@@ -1092,23 +1103,10 @@ topbar.pack_propagate(
 
 ctk.CTkLabel(
     topbar,
-    text="FC ONLINE",
-    text_color=TEXT,
-    font=ctk.CTkFont(
-        size=22,
-        weight="bold"
-    )
-).pack(
-    side="left"
-)
-
-
-ctk.CTkLabel(
-    topbar,
-    text="AUTO BUY BOT",
+    text="AUTO BUY",
     text_color=GREEN,
     font=ctk.CTkFont(
-        size=11,
+        size=18,
         weight="bold"
     )
 ).pack(
@@ -1186,7 +1184,7 @@ input_card = ctk.CTkFrame(
     border_width=1,
     border_color=BORDER,
     corner_radius=16,
-    height=190
+    height=218
 )
 
 input_card.grid(
@@ -1328,25 +1326,25 @@ delete_profile_button.pack(
 
 
 # ============================================================
-# TARGET
+# TARGET + QUANTITY ROW
 # ============================================================
 
-target_row = ctk.CTkFrame(
+target_quantity_row = ctk.CTkFrame(
     input_content,
     fg_color="transparent",
     height=31
 )
 
-target_row.pack(
+target_quantity_row.pack(
     fill="x",
     pady=(4, 0)
 )
 
-target_row.pack_propagate(False)
+target_quantity_row.pack_propagate(False)
 
 
 ctk.CTkLabel(
-    target_row,
+    target_quantity_row,
     text="🛒  CẦU THỦ",
     text_color=TEXT,
     font=ctk.CTkFont(
@@ -1359,8 +1357,8 @@ ctk.CTkLabel(
 
 
 target_entry = ctk.CTkEntry(
-    target_row,
-    width=85,
+    target_quantity_row,
+    width=70,
     height=29,
     fg_color=INNER_COLOR,
     border_color="#3B4A55",
@@ -1368,18 +1366,58 @@ target_entry = ctk.CTkEntry(
     corner_radius=8,
     text_color=TEXT,
     font=ctk.CTkFont(
-        size=12,
+        size=11,
         weight="bold"
     )
 )
 
 target_entry.pack(
-    side="right"
+    side="left",
+    padx=(7, 18)
 )
 
 target_entry.insert(
     0,
     "10"
+)
+
+
+ctk.CTkLabel(
+    target_quantity_row,
+    text="SỐ LƯỢNG / LẦN",
+    text_color=MUTED,
+    font=ctk.CTkFont(
+        size=8,
+        weight="bold"
+    )
+).pack(
+    side="left"
+)
+
+
+quantity_entry = ctk.CTkEntry(
+    target_quantity_row,
+    width=70,
+    height=29,
+    fg_color=INNER_COLOR,
+    border_color="#3B4A55",
+    border_width=1,
+    corner_radius=8,
+    text_color=TEXT,
+    font=ctk.CTkFont(
+        size=11,
+        weight="bold"
+    )
+)
+
+quantity_entry.pack(
+    side="left",
+    padx=(7, 0)
+)
+
+quantity_entry.insert(
+    0,
+    "1"
 )
 
 
@@ -1502,7 +1540,7 @@ max_price_entry.bind(
 
 ctk.CTkLabel(
     input_content,
-    text="Profile lưu MIN / MAX / giá tối đa để dùng lại lần sau",
+    text="Profile chỉ lưu MIN / MAX / giá thẻ • Số lượng không lưu",
     text_color="#63717B",
     font=ctk.CTkFont(
         size=7

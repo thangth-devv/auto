@@ -483,6 +483,10 @@ STAT_MAX_Y = 326
 MAX_CARD_PRICE_X = 986
 MAX_CARD_PRICE_Y = 449
 
+# Số lượng mua mỗi lần (ô Số lượng trên FC Online)
+QUANTITY_X = 1058
+QUANTITY_Y = 509
+
 
 
 def double_click_input(hwnd, image_x, image_y):
@@ -591,11 +595,153 @@ def set_filter_by_double_click(
     )
 
 
+def read_filter_value(
+    hwnd,
+    image_x,
+    image_y,
+    expected=None
+):
+    """Đọc giá trị đang hiển thị trong ô lọc bằng OCR."""
+    candidates = []
+
+    for _ in range(5):
+        screen = capture_fco(hwnd)
+        screen_height, screen_width = screen.shape[:2]
+
+        # Chỉ lấy vùng số, tránh OCR nhầm nhãn và ô lọc kế bên.
+        left = max(0, image_x - 42)
+        top = max(0, image_y - 16)
+        right = min(screen_width, image_x + 42)
+        bottom = min(screen_height, image_y + 16)
+        roi = screen[top:bottom, left:right]
+
+        if roi.size == 0:
+            continue
+
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        enlarged = cv2.resize(
+            gray,
+            None,
+            fx=3,
+            fy=3,
+            interpolation=cv2.INTER_CUBIC
+        )
+        images = [
+            enlarged,
+            cv2.threshold(
+                enlarged,
+                0,
+                255,
+                cv2.THRESH_BINARY + cv2.THRESH_OTSU
+            )[1]
+        ]
+
+        for image in images:
+            text = pytesseract.image_to_string(
+                image,
+                config="--psm 7 -c tessedit_char_whitelist=0123456789",
+                lang="eng"
+            )
+            value = "".join(char for char in text if char.isdigit())
+            if value:
+                if expected is not None and value == expected:
+                    return value
+                candidates.append(value)
+
+        random_sleep(0.03, 0.05)
+
+    if not candidates:
+        return ""
+
+    return max(
+        set(candidates),
+        key=candidates.count
+    )
+
+
+def set_filter_with_verification(
+    hwnd,
+    image_x,
+    image_y,
+    value,
+    label,
+    log_callback=None,
+    max_attempts=3
+):
+    """Nhập một ô lọc và xác minh lại giá trị bằng OCR."""
+    expected = "".join(
+        char for char in str(value)
+        if char.isdigit()
+    )
+
+    for attempt in range(1, max_attempts + 1):
+        set_filter_by_double_click(
+            hwnd,
+            image_x,
+            image_y,
+            value,
+            label,
+            log_callback
+        )
+
+        actual = read_filter_value(
+            hwnd,
+            image_x,
+            image_y,
+            expected=expected
+        )
+
+        if actual == expected:
+            log_message(
+                f"    ✅ Đã xác minh '{label}': {actual}",
+                log_callback
+            )
+            return
+
+        # OCR không đọc được thì không được kết luận ô nhập sai.
+        # Giá trị đã được nhập và Enter; tiếp tục tránh dừng bot oan.
+        if not actual:
+            log_message(
+                f"    ⚠️ Không đọc được '{label}' bằng OCR; "
+                "giữ giá trị vừa nhập.",
+                log_callback
+            )
+            return
+
+        # Xác nhận lại một lần trước khi nhập lại để tránh OCR đọc nhầm.
+        confirmed_actual = read_filter_value(
+            hwnd,
+            image_x,
+            image_y,
+            expected=actual
+        )
+        if confirmed_actual != actual:
+            log_message(
+                f"    ⚠️ OCR chưa ổn định cho '{label}'; "
+                "giữ giá trị vừa nhập.",
+                log_callback
+            )
+            return
+
+        log_message(
+            f"    ⚠️ '{label}' chưa đúng "
+            f"(đọc được '{actual}', cần '{expected}') "
+            f"- nhập lại lần {attempt}/{max_attempts}.",
+            log_callback
+        )
+
+    raise RuntimeError(
+        f"{label} không khớp sau {max_attempts} lần "
+        f"(cần {expected})."
+    )
+
+
 def set_purchase_filters(
     hwnd,
     stat_min,
     stat_max,
     max_card_price,
+    quantity,
     log_callback=None
 ):
     """
@@ -612,7 +758,7 @@ def set_purchase_filters(
     )
 
     # 1. MIN
-    set_filter_by_double_click(
+    set_filter_with_verification(
         hwnd,
         STAT_MIN_X,
         STAT_MIN_Y,
@@ -622,7 +768,7 @@ def set_purchase_filters(
     )
 
     # 2. MAX
-    set_filter_by_double_click(
+    set_filter_with_verification(
         hwnd,
         STAT_MAX_X,
         STAT_MAX_Y,
@@ -632,80 +778,30 @@ def set_purchase_filters(
     )
 
     # 3. Giá tối đa mỗi thẻ
-    set_filter_by_double_click(
+    set_filter_with_verification(
         hwnd,
         MAX_CARD_PRICE_X,
         MAX_CARD_PRICE_Y,
         max_card_price,
         "Giá tối đa mỗi thẻ",
+        log_callback
+    )
+
+    # 4. Số lượng mỗi lần mua - KHÔNG nằm trong profile.
+    set_filter_with_verification(
+        hwnd,
+        QUANTITY_X,
+        QUANTITY_Y,
+        quantity,
+        "Số lượng",
         log_callback
     )
 
     log_message(
         f"✅ Đã điền filter: MIN={stat_min} | "
         f"MAX={stat_max} | "
-        f"Giá/thẻ={max_card_price:,}",
-        log_callback
-    )
-
-
-
-def set_purchase_filters(
-    hwnd,
-    stat_min,
-    stat_max,
-    max_card_price,
-    log_callback=None
-):
-    """
-    Thiết lập:
-      - Chỉ số min
-      - Chỉ số max
-      - Giá trị tối đa mỗi thẻ
-
-    Chỉ thực hiện một lần trước Step 1.
-    """
-
-    log_message(
-        "⚙️ Đang thiết lập bộ lọc mua hàng...",
-        log_callback
-    )
-
-    log_message(
-        "🧹 Click ô Chỉ số → DELETE → nhập MIN/MAX.",
-        log_callback
-    )
-
-    set_filter_by_double_click(
-        hwnd,
-        STAT_MIN_X,
-        STAT_MIN_Y,
-        stat_min,
-        "Chỉ số MIN",
-        log_callback
-    )
-
-    set_filter_by_double_click(
-        hwnd,
-        STAT_MAX_X,
-        STAT_MAX_Y,
-        stat_max,
-        "Chỉ số MAX",
-        log_callback
-    )
-
-    set_filter_by_double_click(
-        hwnd,
-        MAX_CARD_PRICE_X,
-        MAX_CARD_PRICE_Y,
-        max_card_price,
-        "Giá tối đa mỗi thẻ",
-        log_callback
-    )
-
-    log_message(
-        f"✅ Bộ lọc: MIN={stat_min} | MAX={stat_max} | "
-        f"Giá/thẻ={max_card_price:,}",
+        f"Giá/thẻ={max_card_price:,} | "
+        f"Số lượng={quantity}",
         log_callback
     )
 
@@ -1385,6 +1481,7 @@ def run_auto_buy(
     stat_min,
     stat_max,
     max_card_price,
+    quantity,
     stop_event=None,
     log_callback=None,
     player_count_callback=None
@@ -1487,6 +1584,7 @@ def run_auto_buy(
             stat_min,
             stat_max,
             max_card_price,
+            quantity,
             log_callback=log_callback
         )
     except Exception as exc:
