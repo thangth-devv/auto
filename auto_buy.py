@@ -137,6 +137,25 @@ def capture_fco(hwnd):
     return screen
 
 
+def wait_for_valid_window(hwnd, timeout=10):
+    deadline = time.time() + timeout
+
+    while time.time() < deadline:
+        if not win32gui.IsWindow(hwnd):
+            raise RuntimeError("Cửa sổ FC ONLINE không còn tồn tại.")
+
+        left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+
+        if right > left and bottom > top:
+            return
+
+        time.sleep(0.2)
+
+    raise RuntimeError(
+        "Cửa sổ FC ONLINE chưa sẵn sàng (kích thước 0x0)."
+    )
+
+
 # ============================================================
 # LOAD TEMPLATE
 # ============================================================
@@ -599,7 +618,8 @@ def read_filter_value(
     hwnd,
     image_x,
     image_y,
-    expected=None
+    expected=None,
+    roi_half_width=42
 ):
     """Đọc giá trị đang hiển thị trong ô lọc bằng OCR."""
     candidates = []
@@ -609,9 +629,9 @@ def read_filter_value(
         screen_height, screen_width = screen.shape[:2]
 
         # Chỉ lấy vùng số, tránh OCR nhầm nhãn và ô lọc kế bên.
-        left = max(0, image_x - 42)
+        left = max(0, image_x - roi_half_width)
         top = max(0, image_y - 16)
-        right = min(screen_width, image_x + 42)
+        right = min(screen_width, image_x + roi_half_width)
         bottom = min(screen_height, image_y + 16)
         roi = screen[top:bottom, left:right]
 
@@ -666,11 +686,18 @@ def set_filter_with_verification(
     value,
     label,
     log_callback=None,
-    max_attempts=3
+    max_attempts=3,
+    verification_value=None,
+    verification_roi_half_width=42
 ):
     """Nhập một ô lọc và xác minh lại giá trị bằng OCR."""
+    expected_value = (
+        value
+        if verification_value is None
+        else verification_value
+    )
     expected = "".join(
-        char for char in str(value)
+        char for char in str(expected_value)
         if char.isdigit()
     )
 
@@ -688,7 +715,8 @@ def set_filter_with_verification(
             hwnd,
             image_x,
             image_y,
-            expected=expected
+            expected=expected,
+            roi_half_width=verification_roi_half_width
         )
 
         if actual == expected:
@@ -713,7 +741,8 @@ def set_filter_with_verification(
             hwnd,
             image_x,
             image_y,
-            expected=actual
+            expected=actual,
+            roi_half_width=verification_roi_half_width
         )
         if confirmed_actual != actual:
             log_message(
@@ -784,7 +813,9 @@ def set_purchase_filters(
         MAX_CARD_PRICE_Y,
         max_card_price,
         "Giá tối đa mỗi thẻ",
-        log_callback
+        log_callback,
+        verification_value=max_card_price * 10000,
+        verification_roi_half_width=140
     )
 
     # 4. Số lượng mỗi lần mua - KHÔNG nằm trong profile.
@@ -1579,6 +1610,8 @@ def run_auto_buy(
     # ========================================================
 
     try:
+        wait_for_valid_window(hwnd)
+
         set_purchase_filters(
             hwnd,
             stat_min,

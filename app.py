@@ -95,25 +95,54 @@ except Exception:
 # ============================================================
 
 def find_fc_online():
-    found_hwnd = None
+    candidates = []
 
     def enum_window(hwnd, _):
-        nonlocal found_hwnd
-
         if not win32gui.IsWindowVisible(hwnd):
             return
 
-        title = win32gui.GetWindowText(hwnd)
+        try:
+            left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+        except win32gui.error:
+            return
 
-        if title.strip().upper() == "":
-            found_hwnd = hwnd
+        width = right - left
+        height = bottom - top
+
+        if width < 640 or height < 360:
+            return
+
+        title = win32gui.GetWindowText(hwnd)
+        class_name = win32gui.GetClassName(hwnd)
+        title_upper = title.strip().upper()
+        class_upper = class_name.strip().upper()
+        is_fc_candidate = any(
+            keyword in f"{title_upper} {class_upper}"
+            for keyword in (
+                "FC ONLINE",
+                "EA SPORTS FC",
+                "FIFA"
+            )
+        )
+
+        if title_upper == "" or is_fc_candidate:
+            candidates.append(
+                (
+                    1 if is_fc_candidate else 0,
+                    width * height,
+                    hwnd
+                )
+            )
 
     win32gui.EnumWindows(
         enum_window,
         None
     )
 
-    return found_hwnd
+    if not candidates:
+        return None
+
+    return max(candidates, key=lambda item: (item[0], item[1]))[2]
 
 
 def auto_scan_fc_online():
@@ -434,6 +463,36 @@ def refresh_profile_combo():
         profile_combo.set("")
 
 
+def profile_usage_count(data):
+    if not isinstance(data, dict):
+        return 0
+
+    usage_count = data.get("usage_count", 0)
+
+    if isinstance(usage_count, bool):
+        return 0
+
+    if isinstance(usage_count, int):
+        return max(usage_count, 0)
+
+    return 0
+
+
+def select_most_used_profile():
+    names = list(profiles.keys())
+
+    if not names:
+        return
+
+    selected_name = max(
+        names,
+        key=lambda name: profile_usage_count(profiles.get(name))
+    )
+
+    profile_combo.set(selected_name)
+    on_profile_selected(selected_name)
+
+
 def on_profile_selected(name):
     data = profiles.get(name)
 
@@ -511,10 +570,12 @@ def save_current_profile():
         )
         return
 
+    current_data = profiles.get(name)
     profiles[name] = {
         "stat_min": stat_min,
         "stat_max": stat_max,
-        "max_card_price": max_card_price
+        "max_card_price": max_card_price,
+        "usage_count": profile_usage_count(current_data)
     }
 
     if save_profiles():
@@ -523,6 +584,17 @@ def save_current_profile():
         add_log(
             f"💾 Đã lưu profile '{name}'."
         )
+
+
+def record_profile_usage():
+    name = profile_combo.get().strip()
+    data = profiles.get(name)
+
+    if not isinstance(data, dict):
+        return
+
+    data["usage_count"] = profile_usage_count(data) + 1
+    save_profiles()
 
 
 def delete_current_profile():
@@ -625,6 +697,27 @@ def start_bot():
 
         return
 
+    try:
+        left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+    except win32gui.error:
+        add_log(
+            "❌ Không đọc được kích thước cửa sổ FC ONLINE."
+        )
+        return
+
+    if right <= left or bottom <= top:
+        add_log(
+            "⚠️ Cửa sổ FC ONLINE chưa sẵn sàng. "
+            "Vui lòng thử lại sau."
+        )
+        return
+
+    add_log(
+        f"🎮 Đã nhận diện cửa sổ FC ONLINE: "
+        f"HWND={hwnd}, kích thước={right - left}x{bottom - top}, "
+        f"class={win32gui.GetClassName(hwnd)}"
+    )
+
     # --------------------------------------------------------
     # VALIDATE INPUT
     # --------------------------------------------------------
@@ -690,6 +783,8 @@ def start_bot():
             "❌ MIN / MAX / Giá tối đa không hợp lệ."
         )
         return
+
+    record_profile_usage()
 
     # --------------------------------------------------------
     # SETTINGS
@@ -1963,6 +2058,7 @@ footer.pack_propagate(
 
 load_profiles()
 refresh_profile_combo()
+select_most_used_profile()
 
 
 # ============================================================
