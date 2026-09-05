@@ -956,13 +956,18 @@ if os.path.exists(ICON_PATH):
 
         icon_image = Image.open(
             ICON_PATH
+        ).convert("RGBA")
+
+        icon_image.thumbnail(
+            (256, 256),
+            Image.Resampling.LANCZOS
         )
 
         icon_photo = ImageTk.PhotoImage(
             icon_image
         )
 
-        app.iconphoto(
+        app.wm_iconphoto(
             True,
             icon_photo
         )

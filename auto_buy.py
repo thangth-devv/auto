@@ -242,6 +242,42 @@ def find_template(screen, template):
     )
 
 
+def create_bold_template(template):
+    gray = cv2.cvtColor(template, cv2.COLOR_BGR2GRAY)
+    text_mask = cv2.inRange(gray, 0, 105)
+    text_mask[:8, :] = 0
+    text_mask[32:, :] = 0
+    text_mask[:, :18] = 0
+    text_mask[:, 122:] = 0
+
+    expanded_mask = cv2.dilate(
+        text_mask,
+        np.ones((2, 2), dtype=np.uint8),
+        iterations=1
+    )
+
+    bold_template = template.copy()
+    bold_template[expanded_mask > 0] = (20, 20, 20)
+    return bold_template
+
+
+def find_buy_bulk_template(screen, templates):
+    best_result = (0.0, 0, 0, "normal")
+
+    for template, variant in templates:
+        confidence, x, y = find_template(screen, template)
+
+        if confidence > best_result[0]:
+            best_result = (
+                confidence,
+                x,
+                y,
+                variant
+            )
+
+    return best_result
+
+
 # ============================================================
 # LOG
 # ============================================================
@@ -994,7 +1030,8 @@ def wait_for_template(
     template,
     timeout=5,
     threshold=0.8,
-    stop_event=None
+    stop_event=None,
+    template_variants=None
 ):
 
     start = time.time()
@@ -1045,10 +1082,16 @@ def wait_for_template(
         # FIND
         # ----------------------------------------------------
 
-        confidence, x, y = find_template(
-            screen,
-            template
-        )
+        if template_variants is None:
+            confidence, x, y = find_template(
+                screen,
+                template
+            )
+        else:
+            confidence, x, y, _ = find_buy_bulk_template(
+                screen,
+                template_variants
+            )
 
 
         if confidence >= threshold:
@@ -1577,6 +1620,10 @@ def run_auto_buy(
         buy_bulk = load_template(
             BUY_BULK
         )
+        buy_bulk_templates = [
+            (buy_bulk, "normal"),
+            (create_bold_template(buy_bulk), "bold")
+        ]
 
         confirm_bulk = load_template(
             CONFIRM_BULK
@@ -1766,16 +1813,17 @@ def run_auto_buy(
             try:
                 screen = capture_fco(hwnd)
 
-                confidence, x, y = find_template(
+                confidence, x, y, variant = find_buy_bulk_template(
                     screen,
-                    buy_bulk
+                    buy_bulk_templates
                 )
 
                 if confidence >= threshold:
                     result = {
                         "confidence": confidence,
                         "x": x,
-                        "y": y
+                        "y": y,
+                        "variant": variant
                     }
                     break
 
@@ -1793,7 +1841,8 @@ def run_auto_buy(
 
         log_message(
             f"✅ Mua hàng loạt "
-            f"(confidence={result['confidence']:.4f})",
+            f"(variant={result['variant']}, "
+            f"confidence={result['confidence']:.4f})",
             log_callback
         )
 
@@ -1909,6 +1958,7 @@ def run_auto_buy(
         # Không có timeout cứng để kết thúc flow.
         result = None
         last_debug = time.time()
+        success_hits = 0
 
         while result is None:
 
@@ -1957,15 +2007,18 @@ def run_auto_buy(
                 # ------------------------------------------------
                 # SUCCESS
                 # ------------------------------------------------
-                # Dùng threshold thấp hơn riêng cho "Nhận ngay".
-                # Template này thường dao động do animation/popup.
-                result_threshold = max(0.70, threshold - 0.10)
+                # Không hạ ngưỡng cho "Nhận ngay": popup thất bại có
+                # thể tạo confidence giả với mẫu này.
+                if receive_conf >= threshold:
+                    success_hits += 1
+                else:
+                    success_hits = 0
 
-                if receive_conf >= result_threshold:
+                if success_hits >= 2:
                     log_message(
                         f"✅ Phát hiện Mua thành công "
                         f"(confidence={receive_conf:.4f}, "
-                        f"threshold={result_threshold:.2f})",
+                        f"threshold={threshold:.2f}, ổn định=2)",
                         log_callback
                     )
 
@@ -2223,9 +2276,9 @@ def run_auto_buy(
 
                     # Nếu game đã quay thẳng về màn mua thì
                     # popup cuối không còn cần xử lý.
-                    buy_conf, _, _ = find_template(
+                    buy_conf, _, _, _ = find_buy_bulk_template(
                         screen,
-                        buy_bulk
+                        buy_bulk_templates
                     )
 
                     if buy_conf >= threshold:
@@ -2381,7 +2434,8 @@ def run_auto_buy(
                 buy_bulk,
                 timeout=5,
                 threshold=threshold,
-                stop_event=stop_event
+                stop_event=stop_event,
+                template_variants=buy_bulk_templates
             )
 
 
