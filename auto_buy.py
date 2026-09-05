@@ -7,7 +7,6 @@ from PIL import ImageGrab
 import win32gui
 import win32con
 import win32api
-import winsound
 
 try:
     import pytesseract
@@ -101,6 +100,7 @@ CONFIRM_RECEIVED = resource_path(
 )
 
 NOTIFY_SOUND = resource_path("notify.mp3")
+NOTIFY_SOUND_ALIAS = "auto_fco_notify"
 
 
 
@@ -1477,29 +1477,59 @@ def read_purchase_count(hwnd, log_callback=None, retries=2):
 # ============================================================
 
 def play_notification(log_callback=None):
-    try:
-        if not os.path.exists(NOTIFY_SOUND):
-            log_message(
-                f"⚠️ Không tìm thấy file nhạc: {NOTIFY_SOUND}",
-                log_callback
-            )
-            return
-
-        winsound.PlaySound(
-            NOTIFY_SOUND,
-            winsound.SND_FILENAME | winsound.SND_ASYNC
-        )
-
+    if not os.path.exists(NOTIFY_SOUND):
         log_message(
-            "🔊 Đã phát nhạc thông báo!",
+            f"⚠️ Không tìm thấy file nhạc: {NOTIFY_SOUND}",
             log_callback
         )
+        return
 
-    except Exception as exc:
+    winmm = ctypes.windll.winmm
+    close_command = f"close {NOTIFY_SOUND_ALIAS}"
+    open_command = (
+        f'open "{NOTIFY_SOUND}" type mpegvideo '
+        f"alias {NOTIFY_SOUND_ALIAS}"
+    )
+
+    winmm.mciSendStringW(
+        close_command,
+        None,
+        0,
+        0
+    )
+
+    open_error = winmm.mciSendStringW(
+        open_command,
+        None,
+        0,
+        0
+    )
+
+    if open_error != 0:
         log_message(
-            f"⚠️ Không phát được nhạc: {exc}",
+            f"⚠️ Không mở được nhạc MP3 (mã lỗi {open_error}).",
             log_callback
         )
+        return
+
+    play_error = winmm.mciSendStringW(
+        f"play {NOTIFY_SOUND_ALIAS} from 0",
+        None,
+        0,
+        0
+    )
+
+    if play_error != 0:
+        log_message(
+            f"⚠️ Không phát được nhạc MP3 (mã lỗi {play_error}).",
+            log_callback
+        )
+        return
+
+    log_message(
+        f"🔊 Đã phát nhạc thông báo: {os.path.basename(NOTIFY_SOUND)}",
+        log_callback
+    )
 
 
 # MAIN AUTO BUY

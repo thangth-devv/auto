@@ -1,5 +1,6 @@
 import customtkinter as ctk
 import win32gui
+import win32con
 import threading
 import ctypes
 import os
@@ -96,6 +97,13 @@ except Exception:
 
 def find_fc_online():
     candidates = []
+    ignored_classes = {
+        "PROGMAN",
+        "WORKERW",
+        "SHELL_TRAYWND",
+        "WINDOWS.UI.CORE.COREWINDOW",
+        "XAMLEXPLORERHOSTISLANDWINDOW"
+    }
 
     def enum_window(hwnd, _):
         if not win32gui.IsWindowVisible(hwnd):
@@ -116,6 +124,19 @@ def find_fc_online():
         class_name = win32gui.GetClassName(hwnd)
         title_upper = title.strip().upper()
         class_upper = class_name.strip().upper()
+
+        if class_upper in ignored_classes:
+            return
+
+        try:
+            owner = win32gui.GetWindow(hwnd, win32con.GW_OWNER)
+            ex_style = win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE)
+        except win32gui.error:
+            return
+
+        if owner or ex_style & win32con.WS_EX_TOOLWINDOW:
+            return
+
         is_fc_candidate = any(
             keyword in f"{title_upper} {class_upper}"
             for keyword in (
@@ -149,7 +170,11 @@ def auto_scan_fc_online():
     global current_hwnd
 
     if not is_running:
-        current_hwnd = find_fc_online()
+        if (
+            current_hwnd is None
+            or not win32gui.IsWindow(current_hwnd)
+        ):
+            current_hwnd = find_fc_online()
 
     app.after(
         2000,
