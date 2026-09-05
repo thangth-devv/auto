@@ -305,22 +305,16 @@ def click_client(
     method="send"
 ):
 
-    left, top, _, _ = win32gui.GetWindowRect(hwnd)
-
-    client_left, client_top = win32gui.ClientToScreen(
+    win32gui.SetForegroundWindow(hwnd)
+    client_x, client_y = image_to_client(
         hwnd,
-        (0, 0)
+        image_x,
+        image_y
     )
 
-    offset_x = client_left - left
-    offset_y = client_top - top
-
-    client_x = image_x - offset_x
-    client_y = image_y - offset_y
-
     lparam = win32api.MAKELONG(
-        client_x,
-        client_y
+        int(client_x),
+        int(client_y)
     )
 
     print(
@@ -529,6 +523,9 @@ def type_text(hwnd, text):
 
 # Tọa độ theo ảnh FC Online 1280x752 hiện tại.
 # Đây là tọa độ trên screenshot full window, giống các template.
+REFERENCE_WIDTH = 1280
+REFERENCE_HEIGHT = 752
+
 STAT_MIN_X = 960
 STAT_MIN_Y = 326
 
@@ -543,17 +540,37 @@ QUANTITY_X = 1058
 QUANTITY_Y = 509
 
 
+def image_to_client(hwnd, image_x, image_y):
+    left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+    window_width = right - left
+    window_height = bottom - top
+    scale_x = window_width / REFERENCE_WIDTH
+    scale_y = window_height / REFERENCE_HEIGHT
+    scaled_x = int(image_x * scale_x)
+    scaled_y = int(image_y * scale_y)
+
+    client_left, client_top = win32gui.ClientToScreen(
+        hwnd,
+        (0, 0)
+    )
+
+    return (
+        scaled_x - (client_left - left),
+        scaled_y - (client_top - top)
+    )
+
 
 def double_click_input(hwnd, image_x, image_y):
     """
     Double-click vào ô nhập bằng SendMessage.
     Không di chuyển chuột vật lý.
     """
-    left, top, right, bottom = win32gui.GetWindowRect(hwnd)
-    client_left, client_top = win32gui.ClientToScreen(hwnd, (0, 0))
-
-    client_x = int(image_x - (client_left - left))
-    client_y = int(image_y - (client_top - top))
+    win32gui.SetForegroundWindow(hwnd)
+    client_x, client_y = image_to_client(
+        hwnd,
+        image_x,
+        image_y
+    )
 
     lparam = win32api.MAKELONG(
         client_x,
