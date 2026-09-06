@@ -304,8 +304,6 @@ def click_client(
     image_y,
     method="send"
 ):
-
-    win32gui.SetForegroundWindow(hwnd)
     client_x, client_y = image_to_client(
         hwnd,
         image_x,
@@ -322,71 +320,32 @@ def click_client(
         f"client=({client_x},{client_y})"
     )
 
+    message = (
+        win32gui.SendMessage
+        if method == "send"
+        else win32gui.PostMessage
+    )
 
-    # ========================================================
-    # SEND MESSAGE
-    # ========================================================
-
-    if method == "send":
-
-        win32gui.SendMessage(
-            hwnd,
-            win32con.WM_MOUSEMOVE,
-            0,
-            lparam
-        )
-
-        random_sleep(0.025, 0.035)
-
-        win32gui.SendMessage(
-            hwnd,
-            win32con.WM_LBUTTONDOWN,
-            win32con.MK_LBUTTON,
-            lparam
-        )
-
-        random_sleep(0.025, 0.035)
-
-        win32gui.SendMessage(
-            hwnd,
-            win32con.WM_LBUTTONUP,
-            0,
-            lparam
-        )
-
-
-    # ========================================================
-    # POST MESSAGE
-    # ========================================================
-
-    elif method == "post":
-
-        win32gui.PostMessage(
-            hwnd,
-            win32con.WM_MOUSEMOVE,
-            0,
-            lparam
-        )
-
-        random_sleep(0.045, 0.065)
-
-        win32gui.PostMessage(
-            hwnd,
-            win32con.WM_LBUTTONDOWN,
-            win32con.MK_LBUTTON,
-            lparam
-        )
-
-        random_sleep(0.045, 0.065)
-
-        win32gui.PostMessage(
-            hwnd,
-            win32con.WM_LBUTTONUP,
-            0,
-            lparam
-        )
-
-
+    message(
+        hwnd,
+        win32con.WM_MOUSEMOVE,
+        0,
+        lparam
+    )
+    random_sleep(0.025, 0.035)
+    message(
+        hwnd,
+        win32con.WM_LBUTTONDOWN,
+        win32con.MK_LBUTTON,
+        lparam
+    )
+    random_sleep(0.025, 0.035)
+    message(
+        hwnd,
+        win32con.WM_LBUTTONUP,
+        0,
+        lparam
+    )
     random_sleep(0.045, 0.065)
 
 
@@ -473,37 +432,47 @@ def key_press(hwnd, vk, char=None):
     )
 
 
+def key_release(hwnd, vk):
+    """Nhả phím modifier mà không gửi thêm ký tự."""
+    win32gui.SendMessage(
+        hwnd,
+        win32con.WM_KEYUP,
+        vk,
+        _key_lparam(vk, key_up=True)
+    )
+
+
 def select_all_input(hwnd):
     """Chọn toàn bộ nội dung của ô đang được focus."""
     win32gui.SendMessage(
         hwnd,
         win32con.WM_KEYDOWN,
         win32con.VK_CONTROL,
-        0
+        _key_lparam(win32con.VK_CONTROL)
     )
-
-    random_sleep(0.02, 0.04)
-
+    random_sleep(0.03, 0.05)
     win32gui.SendMessage(
         hwnd,
         win32con.WM_KEYDOWN,
         ord("A"),
-        0
+        _key_lparam(ord("A"))
     )
-
     win32gui.SendMessage(
         hwnd,
         win32con.WM_KEYUP,
         ord("A"),
-        0
+        _key_lparam(ord("A"), key_up=True)
     )
+    key_release(hwnd, win32con.VK_CONTROL)
 
-    win32gui.SendMessage(
-        hwnd,
-        win32con.WM_KEYUP,
-        win32con.VK_CONTROL,
-        0
-    )
+
+def clear_input(hwnd):
+    """Chọn toàn bộ rồi xóa, lặp lại để tránh game bỏ sót phím nền."""
+    for _ in range(2):
+        select_all_input(hwnd)
+        key_press(hwnd, win32con.VK_DELETE)
+        key_press(hwnd, win32con.VK_BACK)
+        random_sleep(0.06, 0.10)
 
 
 def type_text(hwnd, text):
@@ -563,9 +532,8 @@ def image_to_client(hwnd, image_x, image_y):
 def double_click_input(hwnd, image_x, image_y):
     """
     Double-click vào ô nhập bằng SendMessage.
-    Không di chuyển chuột vật lý.
+    Gửi double-click nền vào ô nhập, không di chuyển chuột thật.
     """
-    win32gui.SetForegroundWindow(hwnd)
     client_x, client_y = image_to_client(
         hwnd,
         image_x,
@@ -573,37 +541,37 @@ def double_click_input(hwnd, image_x, image_y):
     )
 
     lparam = win32api.MAKELONG(
-        client_x,
-        client_y
+        int(client_x),
+        int(client_y)
     )
 
+    win32gui.SendMessage(
+        hwnd,
+        win32con.WM_MOUSEMOVE,
+        0,
+        lparam
+    )
+    random_sleep(0.05, 0.08)
     win32gui.SendMessage(
         hwnd,
         win32con.WM_LBUTTONDOWN,
         win32con.MK_LBUTTON,
         lparam
     )
-
-    random_sleep(0.05, 0.08)
-
     win32gui.SendMessage(
         hwnd,
         win32con.WM_LBUTTONUP,
         0,
         lparam
     )
-
     random_sleep(0.05, 0.08)
-
     win32gui.SendMessage(
         hwnd,
         win32con.WM_LBUTTONDOWN,
         win32con.MK_LBUTTON,
         lparam
     )
-
     random_sleep(0.05, 0.08)
-
     win32gui.SendMessage(
         hwnd,
         win32con.WM_LBUTTONUP,
@@ -618,7 +586,8 @@ def set_filter_by_double_click(
     image_y,
     value,
     label,
-    log_callback=None
+    log_callback=None,
+    clear_before_input=False
 ):
     """
     Click đúp vào ô -> nhập giá trị -> Enter.
@@ -639,6 +608,9 @@ def set_filter_by_double_click(
         0.08,
         0.12
     )
+
+    if clear_before_input:
+        clear_input(hwnd)
 
     log_message(
         f"    ⌨️ Nhập '{value}' vào '{label}'...",
@@ -741,7 +713,8 @@ def set_filter_with_verification(
     log_callback=None,
     max_attempts=3,
     verification_value=None,
-    verification_roi_half_width=42
+    verification_roi_half_width=42,
+    clear_before_input=False
 ):
     """Nhập một ô lọc và xác minh lại giá trị bằng OCR."""
     expected_value = (
@@ -761,7 +734,8 @@ def set_filter_with_verification(
             image_y,
             value,
             label,
-            log_callback
+            log_callback,
+            clear_before_input=clear_before_input
         )
 
         actual = read_filter_value(
@@ -828,8 +802,8 @@ def set_purchase_filters(
 ):
     """
     Flow:
-      1. Double-click Chỉ số MIN -> nhập MIN
-      2. Double-click Chỉ số MAX -> nhập MAX
+      1. Đọc MIN/MAX hiện tại để chọn thứ tự nhập an toàn
+      2. Nhập hai chỉ số theo thứ tự phù hợp
       3. Nhập giá tối đa mỗi thẻ
       4. Quay về flow Mua hàng loạt
     """
@@ -839,25 +813,70 @@ def set_purchase_filters(
         log_callback
     )
 
-    # 1. MIN
-    set_filter_with_verification(
+    current_min = read_filter_value(
         hwnd,
         STAT_MIN_X,
         STAT_MIN_Y,
-        stat_min,
-        "Chỉ số MIN",
-        log_callback
+        roi_half_width=42
     )
-
-    # 2. MAX
-    set_filter_with_verification(
+    current_max = read_filter_value(
         hwnd,
         STAT_MAX_X,
         STAT_MAX_Y,
-        stat_max,
-        "Chỉ số MAX",
-        log_callback
+        roi_half_width=42
     )
+
+    if current_min.isdigit() and current_max.isdigit():
+        current_min_value = int(current_min)
+        current_max_value = int(current_max)
+
+        if stat_min > current_max_value:
+            filter_order = ("max", "min")
+        elif stat_max < current_min_value:
+            filter_order = ("min", "max")
+        else:
+            filter_order = ("max", "min")
+
+        log_message(
+            f"    🔁 Giá trị hiện tại: MIN={current_min_value} | "
+            f"MAX={current_max_value} -> nhập "
+            f"{filter_order[0].upper()} trước.",
+            log_callback
+        )
+    else:
+        filter_order = ("max", "min")
+        log_message(
+            "    ⚠️ Không đọc được MIN/MAX hiện tại; "
+            "giữ thứ tự MAX trước MIN.",
+            log_callback
+        )
+
+    filter_configs = {
+        "min": (
+            STAT_MIN_X,
+            STAT_MIN_Y,
+            stat_min,
+            "Chỉ số MIN"
+        ),
+        "max": (
+            STAT_MAX_X,
+            STAT_MAX_Y,
+            stat_max,
+            "Chỉ số MAX"
+        )
+    }
+
+    for filter_name in filter_order:
+        image_x, image_y, value, label = filter_configs[filter_name]
+        set_filter_with_verification(
+            hwnd,
+            image_x,
+            image_y,
+            value,
+            label,
+            log_callback,
+            clear_before_input=True
+        )
 
     # 3. Giá tối đa mỗi thẻ
     set_filter_with_verification(

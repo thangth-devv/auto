@@ -137,23 +137,18 @@ def find_fc_online():
         if owner or ex_style & win32con.WS_EX_TOOLWINDOW:
             return
 
-        is_fc_candidate = any(
-            keyword in f"{title_upper} {class_upper}"
-            for keyword in (
-                "FC ONLINE",
-                "EA SPORTS FC",
-                "FIFA"
+        # Chỉ nhận đúng title của client game, tránh bắt nhầm các cửa sổ
+        # có chứa "FC ONLINE" như tiêu đề phụ hoặc công cụ khác.
+        if title_upper != "FC ONLINE":
+            return
+
+        candidates.append(
+            (
+                1,
+                width * height,
+                hwnd
             )
         )
-
-        if title_upper == "" or is_fc_candidate:
-            candidates.append(
-                (
-                    1 if is_fc_candidate else 0,
-                    width * height,
-                    hwnd
-                )
-            )
 
     win32gui.EnumWindows(
         enum_window,
