@@ -508,6 +508,9 @@ MAX_CARD_PRICE_Y = 449
 QUANTITY_X = 1058
 QUANTITY_Y = 509
 
+CONFIRM_WAIT_TIMEOUT = 7
+RESULT_WAIT_TIMEOUT = 7
+
 
 def image_to_client(hwnd, image_x, image_y):
     left, top, right, bottom = win32gui.GetWindowRect(hwnd)
@@ -1915,8 +1918,10 @@ def run_auto_buy(
         )
 
 
-        # Chờ bằng trạng thái hình ảnh, không dùng timeout.
+        # Chờ nút xác nhận trong thời gian giới hạn.
         result = None
+        confirm_wait_started = time.time()
+        confirm_timed_out = False
 
         while result is None:
 
@@ -1952,9 +1957,21 @@ def run_auto_buy(
                     log_callback
                 )
 
+            if time.time() - confirm_wait_started >= CONFIRM_WAIT_TIMEOUT:
+                log_message(
+                    "⚠️ Không tìm thấy 'Xác nhận' sau "
+                    f"{CONFIRM_WAIT_TIMEOUT} giây; sẽ bấm lại "
+                    "'Mua hàng loạt'.",
+                    log_callback
+                )
+                confirm_timed_out = True
+                break
+
             random_sleep(0.045, 0.065)
 
         if result is None:
+            if confirm_timed_out:
+                continue
             break
 
 
@@ -1991,10 +2008,11 @@ def run_auto_buy(
         )
 
         # Chỉ dùng hình ảnh để xác định trạng thái.
-        # Không có timeout cứng để kết thúc flow.
+        # Nếu game không chuyển trạng thái, quay lại bước "Mua hàng loạt".
         result = None
         last_debug = time.time()
         success_hits = 0
+        result_wait_started = time.time()
 
         while result is None:
 
@@ -2081,6 +2099,15 @@ def run_auto_buy(
 
                     last_debug = time.time()
 
+                if time.time() - result_wait_started >= RESULT_WAIT_TIMEOUT:
+                    log_message(
+                        "⚠️ Không thấy popup kết quả sau "
+                        f"{RESULT_WAIT_TIMEOUT} giây; quay lại bấm "
+                        "'Mua hàng loạt'.",
+                        log_callback
+                    )
+                    break
+
             except Exception as exc:
 
                 log_message(
@@ -2100,7 +2127,17 @@ def run_auto_buy(
             )
 
         if result is None:
-            break
+            if (
+                stop_event is not None
+                and stop_event.is_set()
+            ):
+                break
+
+            log_message(
+                "🔄 Đang tìm lại 'Mua hàng loạt'...",
+                log_callback
+            )
+            continue
 
         result_type = result[0]
 

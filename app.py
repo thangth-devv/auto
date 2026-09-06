@@ -575,6 +575,14 @@ def save_current_profile():
         if stat_min <= 0 or stat_max <= 0 or quantity <= 0:
             raise ValueError
 
+        if quantity > 10:
+            quantity = 10
+            quantity_entry.delete(0, "end")
+            quantity_entry.insert(0, "10")
+            add_log(
+                "⚠️ Số lượng tối đa là 10; đã tự động đổi về 10."
+            )
+
         if stat_min > stat_max:
             add_log(
                 "❌ Chỉ số MIN không được lớn hơn MAX."
@@ -1539,6 +1547,39 @@ quantity_entry.insert(
     0,
     "1"
 )
+
+
+def limit_quantity(event=None):
+    value = quantity_entry.get().strip()
+    if not value.isdigit():
+        return
+
+    if int(value) > 10:
+        quantity_entry.delete(0, "end")
+        quantity_entry.insert(0, "10")
+        add_log(
+            "⚠️ Số lượng tối đa là 10; đã tự động đổi về 10."
+        )
+
+
+quantity_entry.bind(
+    "<KeyRelease>",
+    limit_quantity,
+    add="+"
+)
+quantity_entry.bind(
+    "<FocusOut>",
+    limit_quantity,
+    add="+"
+)
+
+
+def enforce_quantity_limit():
+    limit_quantity()
+    app.after(100, enforce_quantity_limit)
+
+
+app.after(100, enforce_quantity_limit)
 
 
 # ============================================================
