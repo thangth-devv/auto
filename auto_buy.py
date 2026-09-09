@@ -8,6 +8,10 @@ import win32gui
 import win32con
 import win32api
 
+
+_active_stop_event = None
+
+
 try:
     import pytesseract
 except ImportError as exc:
@@ -20,14 +24,23 @@ pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH
 
 
 # ============================================================
-# RANDOM SLEEP
+# INTERRUPTIBLE SLEEP
 # ============================================================
+
+def interruptible_sleep(seconds):
+    """Wait briefly, but wake up immediately when Stop is requested."""
+    if _active_stop_event is not None:
+        return _active_stop_event.wait(seconds)
+
+    time.sleep(seconds)
+    return False
+
 
 def random_sleep(min_seconds, max_seconds):
     """
     Sleep với thời gian ngẫu nhiên trong khoảng rất nhỏ.
     """
-    time.sleep(
+    return interruptible_sleep(
         random.uniform(
             min_seconds,
             max_seconds
@@ -149,7 +162,7 @@ def wait_for_valid_window(hwnd, timeout=10):
         if right > left and bottom > top:
             return
 
-        time.sleep(0.2)
+        interruptible_sleep(0.2)
 
     raise RuntimeError(
         "Cửa sổ FC ONLINE chưa sẵn sàng (kích thước 0x0)."
@@ -1312,7 +1325,7 @@ def click_until_disappear(
         )
 
 
-        time.sleep(
+        interruptible_sleep(
             wait_after_click
         )
 
@@ -1386,7 +1399,7 @@ def click_until_disappear(
         x = new_x
         y = new_y
 
-        time.sleep(
+        interruptible_sleep(
             0.15
         )
 
@@ -1629,6 +1642,10 @@ def run_auto_buy(
     log_callback=None,
     player_count_callback=None
 ):
+    global _active_stop_event
+
+    _active_stop_event = stop_event
+
 
     # ========================================================
     # VALIDATE HWND
@@ -1894,7 +1911,7 @@ def run_auto_buy(
         )
 
 
-        time.sleep(
+        interruptible_sleep(
             0.15
         )
 
@@ -1990,7 +2007,7 @@ def run_auto_buy(
         )
 
 
-        time.sleep(
+        interruptible_sleep(
             0.15
         )
 
@@ -2199,7 +2216,7 @@ def run_auto_buy(
             )
 
 
-            time.sleep(
+            interruptible_sleep(
                 0.15
             )
 
@@ -2261,7 +2278,7 @@ def run_auto_buy(
             )
 
 
-            time.sleep(
+            interruptible_sleep(
                 0.4
             )
 
@@ -2531,7 +2548,7 @@ def run_auto_buy(
 
 
             # Delay giữa các lần mua
-            time.sleep(
+            interruptible_sleep(
                 0.15
             )
 
