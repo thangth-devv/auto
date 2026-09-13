@@ -1,1227 +1,536 @@
-# FC Online Auto Buy – Architecture
+# Player Insert - Architecture
 
 ## 1. Mục tiêu
 
-FC Online Auto Buy là desktop automation tool điều khiển FC Online thông qua:
+Player Insert tự động chèn cầu thủ theo giờ reset trong FC Online:
 
-- CustomTkinter: giao diện người dùng.
-- Win32 API: gửi mouse events vào cửa sổ game.
-- PIL/ImageGrab + NumPy: chụp màn hình game.
-- OpenCV: nhận diện nút bằng template matching.
-- Tesseract OCR: đọc số lượng cầu thủ thực tế mua được.
-- winsound: phát âm thanh khi đạt đủ số lượng mục tiêu.
+- Sort hàng đợi một lần khi bấm `START`.
+- Giữ thứ tự đã sort trong suốt phiên chạy.
+- Mỗi lần chỉ xử lý một cầu thủ hiện tại.
+- Chọn cầu thủ bằng **VỊ TRÍ** trong game.
+- Dùng **THỨ TỰ** để xác định cầu thủ nào được xử lý trước.
+- Đọc giá tối đa sau khi mở popup `Mua cầu thủ`.
+- Mua khi giá thay đổi.
+- Nhấn `ESC` khi giá chưa đổi.
+- Lưu GIF trong 3 giây sau khi mua thành công.
 
-Mục tiêu kiến trúc là tách riêng UI, business flow, image detection, OCR, input và notification để code dễ debug, mở rộng và build thành EXE.
+## 2. Khái niệm dữ liệu
 
----
-
-## 2. High-Level Architecture
+Mỗi dòng cấu hình có dạng:
 
 ```text
-                          +----------------------+
-                          |      FC ONLINE       |
-                          |      Game Client     |
-                          +----------+-----------+
-                                     |
-                              Screen Capture
-                                     |
-                                     v
-+------------------------------------------------------------------+
-|                    FC ONLINE AUTO BUY                            |
-|                                                                  |
-|  +--------------------+                                          |
-|  |       UI Layer     |                                          |
-|  |   CustomTkinter    |                                          |
-|  |                    |                                          |
-|  | - Target players   |                                          |
-|  | - Start / Stop     |                                          |
-|  | - Status           |                                          |
-|  | - Progress         |                                          |
-|  | - Logs             |                                          |
-|  +---------+----------+                                          |
-|            |                                                     |
-|            v                                                     |
-|  +--------------------+                                          |
-|  |   Bot Controller   |                                          |
-|  |                    |                                          |
-|  | - Lifecycle        |                                          |
-|  | - Start / Stop     |                                          |
-|  | - Thread           |                                          |
-|  | - Progress         |                                          |
-|  +---------+----------+                                          |
-|            |                                                     |
-|            v                                                     |
-|  +------------------------------------------------------------+  |
-|  |                    State Machine                           |  |
-|  |                                                            |  |
-|  | BUY -> BUY_CONFIRM -> WAIT_RESULT                          |  |
-|  |                         |                                  |  |
-|  |               +---------+---------+                        |  |
-|  |               |                   |                        |  |
-|  |             FAILURE             SUCCESS                    |  |
-|  |               |                   |                        |  |
-|  |               v                   v                        |  |
-|  |        FAILURE_CONFIRM         RECEIVE                     |  |
-|  |               |                   |                        |  |
-|  |               +-> BUY             v                        |  |
-|  |                          FINAL_CONFIRM                      |  |
-|  |                               |                            |  |
-|  |                               v                            |  |
-|  |                           OCR_COUNT                        |  |
-|  |                               |                            |  |
-|  |                               v                            |  |
-|  |                         UPDATE_COUNTER                     |  |
-|  |                               |                            |  |
-|  |                    +----------+-----------+                |  |
-|  |                    |                      |                |  |
-|  |                 NOT_DONE              COMPLETED            |  |
-|  |                    |                      |                |  |
-|  |                    v                      v                |  |
-|  |                   BUY                NOTIFICATION          |  |
-|  +------------------------------------------------------------+  |
-|                                                                  |
-|  +----------------+  +----------------+  +-------------------+  |
-|  | Image Detector |  |   OCR Service  |  | Input Controller  |  |
-|  | OpenCV         |  | Tesseract      |  | Win32 API         |  |
-|  +----------------+  +----------------+  +-------------------+  |
-|                                                                  |
-|  +--------------------+                                          |
-|  | Notification       |                                          |
-|  | winsound + audio   |                                          |
-|  +--------------------+                                          |
-+------------------------------------------------------------------+
+{
+    "position": 5,      # vị trí cầu thủ trong danh sách game
+    "reset": "l32",     # giờ lẻ, phút 32
+    "quantity": 10      # số lượng cần mua
+}
 ```
 
----
+### 2.1 THỨ TỰ
 
-## 3. State Machine
+`THỨ TỰ` là thứ tự xử lý trong hàng đợi sau khi sort theo reset gần nhất.
 
-State Machine là phần trung tâm của bot. Flow không nên phụ thuộc vào việc `sleep` một khoảng cố định rồi giả định game đã chuyển trạng thái.
-
-### States
+Ví dụ tại thời điểm hiện tại:
 
 ```text
-IDLE
+Thứ tự 1: vị trí 5, l32
+Thứ tự 2: vị trí 3, l50
+Thứ tự 3: vị trí 4, l43
+```
+
+Bot phải xử lý thứ tự 1 xong hoặc hết thời gian của thứ tự 1 trước khi
+chuyển sang thứ tự 2.
+
+### 2.2 VỊ TRÍ
+
+`VỊ TRÍ` là dòng cầu thủ trong game để click:
+
+```python
+row_y = PLAYER_ROW_FIRST_Y + (position - 1) * PLAYER_ROW_STEP_Y
+```
+
+Sort không được thay đổi giá trị `position`.
+
+### 2.3 Mã reset
+
+```text
+cNN = giờ chẵn, phút NN
+lNN = giờ lẻ, phút NN
+```
+
+Ví dụ:
+
+```text
+l32 -> giờ lẻ, phút 32
+c50 -> giờ chẵn, phút 50
+```
+
+Mã reset được chuẩn hóa bằng `normalize_reset_code()`.
+
+## 3. Kiến trúc tổng quan
+
+```text
+CustomTkinter UI (app.py)
+        |
+        | entries, stop_event, log_callback
+        v
+Player Insert Worker (player_insert.py)
+        |
+        +--> Queue Sorter
+        +--> Queue State Machine
+        +--> Input Controller (auto_buy.py)
+        +--> Screen Capture (capture_fco)
+        +--> Price OCR (Tesseract)
+        +--> GIF Recorder
+        |
+        v
+FC Online window
+```
+
+### 3.1 UI
+
+File: `app.py`
+
+Trách nhiệm:
+
+- Nhập vị trí, reset, số lượng.
+- Sort và ghi lại thứ tự hiển thị khi `START`.
+- Chạy worker thread.
+- Hiển thị log.
+- Lưu/tải profile `profiles.json`.
+- Không tự click game hoặc chạy OCR.
+
+### 3.2 Worker
+
+File: `player_insert.py`
+
+Trách nhiệm:
+
+- Sort queue.
+- Chọn vị trí cầu thủ hiện tại.
+- Điều khiển popup mua.
+- Đọc giá max.
+- Chờ reset.
+- Retry trong cửa sổ reset.
+- Mua và ghi GIF.
+
+### 3.3 Input
+
+File: `auto_buy.py`
+
+Các thao tác chính:
+
+```python
+click_client(hwnd, x, y)
+key_press(hwnd, win32con.VK_ESCAPE)
+double_click_input(hwnd, x, y)
+type_text(hwnd, text)
+```
+
+Nút `Mua cầu thủ` dùng tọa độ cố định, không dùng template matching:
+
+```python
+BUY_PLAYER_X
+BUY_PLAYER_Y
+```
+
+## 4. Queue sorting
+
+Khi bấm `START`:
+
+1. Đọc toàn bộ dòng có cấu hình.
+2. Chuẩn hóa mã reset.
+3. Tính reset gần nhất so với `datetime.now()`.
+4. Sort tăng dần theo thời điểm reset.
+5. Ghi dữ liệu đã sort ngược lại UI.
+6. Gán lại số `THỨ TỰ` từ 1.
+7. Truyền queue đã sort vào worker.
+
+```python
+sorted_entries = sort_entries_by_reset(entries)
+```
+
+Sau khi worker bắt đầu, không sort lại trong vòng lặp. Queue chỉ tiến về phía
+trước sau khi cầu thủ hiện tại:
+
+- mua thành công; hoặc
+- hết 20 phút của cửa sổ reset mà giá không đổi.
+
+Không được quét tất cả cầu thủ để chọn cầu thủ có reset đang mở. Điều này sẽ
+làm cầu thủ phía sau nhảy lên trước.
+
+## 5. State machine
+
+```text
+START
   |
   v
-BUY
+SORT_QUEUE
   |
   v
-BUY_CONFIRM
+SELECT_CURRENT_PLAYER
   |
   v
-WAIT_RESULT
-  |-----------------------------|
-  |                             |
-  v                             v
-FAILURE                       SUCCESS
-  |                             |
-  v                             v
-FAILURE_CONFIRM              RECEIVE
-  |                             |
-  |                             v
-  +---------> BUY           FINAL_CONFIRM
-                                |
-                                v
-                             OCR_COUNT
-                                |
-                                v
-                         UPDATE_COUNTER
-                                |
-                    +-----------+-----------+
-                    |                       |
-                    v                       v
-                 BUY AGAIN              COMPLETED
-                                            |
-                                            v
-                                      NOTIFICATION
-                                            |
-                                            v
-                                          STOPPED
+OPEN_BUY_POPUP
+  |
+  v
+READ_BASE_PRICE
+  |
+  v
+CLOSE_POPUP
+  |
+  +--> WAIT_FOR_RESET
+  |       |
+  |       +--> PREPARE_ONE_MINUTE_BEFORE_RESET
+  |       |       |
+  |       |       +--> READ_BASE_PRICE
+  |       |
+  |       +--> RESET_WINDOW
+  |               |
+  |               v
+  |          OPEN_BUY_POPUP
+  |               |
+  |               v
+  |          READ_CURRENT_PRICE
+  |               |
+  |       +-------+-------+
+  |       |               |
+  |   PRICE_CHANGED   PRICE_UNCHANGED
+  |       |               |
+  |       v               v
+  |   BUY_PLAYER       PRESS_ESC
+  |       |               |
+  |       v               |
+  |   RECORD_GIF          |
+  |       |               |
+  |       +-------+-------+
+  |               |
+  |               v
+  |        NEXT_QUEUE_ITEM
+  |
+  +--> AFTER_20_MINUTES_UNCHANGED
+              |
+              v
+       NEXT_QUEUE_ITEM
 ```
 
-### State rules
+## 6. Flow chi tiết
 
-#### BUY
-
-Tìm template:
+### 6.1 START
 
 ```text
-templates/buy_bulk.png
+START
+ -> parse configuration
+ -> sort by nearest reset
+ -> update UI
+ -> select first queue item
+ -> click game position
+ -> click Mua cầu thủ
+ -> capture screen
+ -> read Giá tối đa
+ -> log and store base price
+ -> press ESC
 ```
 
-Khi tìm thấy:
+Không đọc giá trước khi mở popup mua.
+
+### 6.2 Chuẩn bị trước reset
+
+Với cầu thủ hiện tại, nếu còn không quá 60 giây đến reset:
 
 ```text
-click Mua hàng loạt
--> BUY_CONFIRM
+click lại vị trí hiện tại
+ -> click Mua cầu thủ
+ -> read Giá tối đa
+ -> cập nhật base price
+ -> press ESC
+ -> chờ giờ reset
 ```
 
-#### BUY_CONFIRM
+Chỉ chuẩn bị một lần cho mỗi thời điểm reset.
 
-Tìm:
+### 6.3 Cửa sổ reset
+
+Cửa sổ xử lý kéo dài 20 phút kể từ reset. Chỉ thử trong 12 giây đầu mỗi phút:
 
 ```text
-templates/confirm_bulk.png
+reset_minute <= current_minute < reset_minute + 20
+current_second < 12
 ```
 
-Khi tìm thấy:
+Mỗi lần thử:
 
 ```text
-click Xác nhận
--> WAIT_RESULT
+click Mua cầu thủ
+ -> chờ popup render tối thiểu
+ -> capture_fco(hwnd)
+ -> OCR Giá tối đa
 ```
 
-#### WAIT_RESULT
+### 6.4 Giá không đổi
 
-Chỉ xác định hai trạng thái thực sự:
+Nếu:
 
-```text
-fco_failure_title.png
-receive_now.png
+```python
+current_price == base_price
 ```
 
-Không dùng `Mua hàng loạt` để xác định kết quả vì nút này có thể vẫn nhìn thấy phía sau popup.
+thì:
 
 ```text
-failure detected -> FAILURE
-receive detected  -> SUCCESS
+press ESC
+ -> giữ nguyên cầu thủ hiện tại
+ -> thử lại ở phút kế tiếp
 ```
 
-#### FAILURE
+Không chuyển sang cầu thủ tiếp theo chỉ vì cầu thủ tiếp theo cũng đang trong
+cửa sổ reset.
 
-Không cộng cầu thủ.
+### 6.5 Giá thay đổi
 
-```text
-+0
+Nếu:
+
+```python
+current_price != base_price
 ```
 
-Sau khi đóng popup:
+thì:
 
 ```text
--> BUY
+click dòng Giá tối đa
 ```
 
-#### SUCCESS
-
-Chờ:
+Nếu `quantity > 1`:
 
 ```text
-receive_now.png
+double_click ô Số lượng mua
+ -> nhập quantity
+ -> click Mua cầu thủ
+```
+
+Nếu `quantity == 1`:
+
+```text
+click Mua cầu thủ
 ```
 
 Sau đó:
 
 ```text
-click Nhận ngay
--> FINAL_CONFIRM
+capture frame trong 3 giây
+ -> save GIF
+ -> chuyển sang queue item kế tiếp
 ```
 
-#### FINAL_CONFIRM
+## 7. Price OCR
 
-Tìm:
+### 7.1 Quy tắc bắt buộc
+
+OCR chỉ chạy sau khi popup mua đã mở.
+
+Giá cần đọc là số nằm cùng dòng với nhãn:
 
 ```text
-confirm_received.png
+Giá tối đa
 ```
 
-Khi thấy popup:
+Không đọc:
 
-```text
--> OCR_COUNT
-```
+- `Giá tối thiểu`.
+- `Giá cầu thủ` phía ngoài popup.
+- Giá nhập trong ô `Giá`.
+- Tổng giá trị.
+- Số lượng mua.
 
-#### OCR_COUNT
+### 7.2 ROI
 
-Đọc câu dạng:
-
-```text
-Bạn đã mua được tổng cộng X cầu thủ
-```
-
-Ví dụ:
-
-```text
-Ban da mua duge tong cong 2 cau tha
-```
-
-Kết quả:
-
-```text
-X = 2
-```
-
-#### UPDATE_COUNTER
-
-Cập nhật:
-
-```text
-purchased_players += X
-```
-
-Không cộng `+1` theo round.
-
-Ví dụ:
-
-```text
-Round 1: +2
-Round 2: +0
-Round 3: +3
-
-Total = 5
-```
-
-Nếu:
-
-```text
-purchased_players >= target_players
-```
-
-thì:
-
-```text
--> COMPLETED
-```
-
-ngược lại:
-
-```text
--> BUY
-```
-
-#### COMPLETED
-
-Phát:
-
-```text
-notify.mp3 / notify.wav
-```
-
-Sau đó stop bot.
-
----
-
-## 4. Component Architecture
-
-### 4.1 UI Layer
-
-File đề xuất:
-
-```text
-ui/app.py
-```
-
-Trách nhiệm:
-
-```text
-- Nhập số cầu thủ mục tiêu
-- START
-- STOP
-- Hiển thị status
-- Hiển thị số đã mua
-- Hiển thị log
-```
-
-UI không xử lý OpenCV/OCR trực tiếp.
-
-UI chỉ giao tiếp với controller:
+ROI được cấu hình theo layout tham chiếu:
 
 ```python
-start_bot()
-stop_bot()
-
-update_status(...)
-update_player_count(...)
-add_log(...)
+REFERENCE_WIDTH = 1280
+REFERENCE_HEIGHT = 752
+MAX_PRICE_ROIS = (...)
 ```
 
----
+ROI phải bao quanh dòng `Giá tối đa`, không bao gồm ô nhập giá bên dưới.
 
-### 4.2 Bot Controller
+Nếu thay đổi scale hoặc kích thước game, phải điều chỉnh ROI hoặc thêm cấu hình
+scale tương ứng.
 
-File:
+### 7.3 Định dạng hợp lệ
 
 ```text
-bot/controller.py
+18.3M -> 18,300,000
+20.1M -> 20,100,000
+1.2B  -> 1,200,000,000
 ```
 
-Trách nhiệm:
+Hiển thị log:
 
 ```text
-- Start bot
-- Stop bot
-- Quản lý thread
-- Lấy HWND FC Online
-- Khởi tạo State Machine
-- Truyền callback về UI
+18.3M
+20.1M
+1.2B
 ```
 
-Controller không nên tự xử lý OCR hoặc template matching.
+Không được suy diễn giá từ số trong ô nhập `20.100.000`.
 
----
+## 8. GIF recorder
 
-### 4.3 State Machine
-
-File:
+GIF bắt đầu khi giá đã thay đổi và kết thúc sau thao tác mua:
 
 ```text
-bot/state_machine.py
+price changed
+ -> capture frame
+ -> click giá tối đa
+ -> nhập quantity nếu cần
+ -> click Mua cầu thủ
+ -> capture tiếp trong 3 giây
+ -> save GIF
 ```
 
-Chứa:
+Thư mục:
 
 ```text
-current_state
-transition
-run current state
+purchase_gifs/
 ```
 
-Ví dụ:
+Tên file:
+
+```text
+position_{position}_{reset}_{timestamp}.gif
+```
+
+GIF chỉ được tạo cho lần mua có giá thay đổi.
+
+## 9. Logging
+
+Log phải phân biệt thứ tự xử lý và vị trí game:
+
+```text
+[Thứ tự 1][Vị trí 5] Đang chọn cầu thủ.
+[Thứ tự 1][Vị trí 5] Giá max mốc: 18.3M.
+[Thứ tự 1][Vị trí 5] Giá hiện tại: 20.1M.
+[Thứ tự 1][Vị trí 5] Đã gửi lệnh mua 10 cầu thủ.
+[Thứ tự 1][Vị trí 5] Đã lưu GIF: ...
+```
+
+Khi giá không đổi:
+
+```text
+[Thứ tự 1][Vị trí 5] Giá không đổi; nhấn ESC và thử lại.
+```
+
+Khi chuyển queue:
+
+```text
+[Thứ tự 1][Vị trí 5] Hoàn tất; chuyển sang thứ tự 2.
+```
+
+## 10. Timing và hiệu năng
+
+Các hằng số:
 
 ```python
-BUY
-BUY_CONFIRM
-WAIT_RESULT
-FAILURE
-FAILURE_CONFIRM
-SUCCESS
-RECEIVE
-FINAL_CONFIRM
-OCR_COUNT
-UPDATE_COUNTER
-COMPLETED
-STOPPED
+PLAYER_SELECTION_WAIT
+PRICE_DIALOG_WAIT
+GIF_CAPTURE_INTERVAL
+GIF_RETURN_WAIT = 3.0
 ```
 
-Lợi ích:
+Không dùng thời gian chờ dài cố định. Chỉ dùng delay tối thiểu để popup kịp
+render trước khi capture.
 
-```text
-Không phải dựa vào:
-sleep -> đoán game đã sẵn sàng
-```
-
-Thay vào đó:
-
-```text
-check image -> xác định state thực tế
-```
-
----
-
-### 4.4 Player Counter
-
-File:
-
-```text
-bot/counter.py
-```
-
-Ví dụ:
-
-```python
-class PlayerCounter:
-    target = 10
-    purchased = 0
-
-    def add(self, count):
-        self.purchased += count
-
-    def is_completed(self):
-        return self.purchased >= self.target
-```
-
-Không để logic counter rải rác trong flow.
-
----
-
-### 4.5 Screen Capture
-
-File:
-
-```text
-services/screen_capture.py
-```
-
-Trách nhiệm:
-
-```text
-HWND
-  |
-  v
-GetWindowRect
-  |
-  v
-ImageGrab
-  |
-  v
-NumPy image
-```
-
-API:
-
-```python
-capture_window(hwnd)
-```
-
----
-
-### 4.6 Image Detector
-
-File:
-
-```text
-services/image_detector.py
-```
-
-Sử dụng:
-
-```text
-OpenCV
-cv2.matchTemplate
-TM_CCOEFF_NORMED
-```
-
-API:
-
-```python
-find_template(screen, template)
-```
-
-Kết quả:
-
-```python
-{
-    "found": True,
-    "confidence": 0.992,
-    "x": 717,
-    "y": 606
-}
-```
-
-Các template:
-
-```text
-templates/
-├── buy_bulk.png
-├── confirm_bulk.png
-├── fco_failure_title.png
-├── receive_now.png
-└── confirm_received.png
-```
-
----
-
-### 4.7 Input Controller
-
-File:
-
-```text
-services/input_controller.py
-```
-
-Trách nhiệm:
-
-```text
-Image coordinates
-       |
-       v
-Client coordinates
-       |
-       v
-WM_MOUSEMOVE
-WM_LBUTTONDOWN
-WM_LBUTTONUP
-```
-
-API:
-
-```python
-click(hwnd, x, y)
-```
-
-Có thể hỗ trợ:
-
-```python
-click(..., method="send")
-click(..., method="post")
-```
-
----
-
-### 4.8 OCR Service
-
-File:
-
-```text
-services/ocr_service.py
-```
-
-Flow:
-
-```text
-Final Confirmation Popup
-        |
-        v
-Crop COUNT_ROI
-        |
-        v
-Resize
-        |
-        v
-Threshold
-        |
-        v
-Tesseract
-        |
-        v
-Text
-        |
-        v
-Regex
-        |
-        v
-X
-```
-
-Ví dụ:
-
-```text
-OCR:
-Ban da mua duge tong cong 2 cau tha
-
-Result:
-2
-```
-
-API:
-
-```python
-read_purchase_count(hwnd)
-```
-
-Kết quả:
-
-```text
-2
-```
-
-Nếu OCR fail:
-
-```text
-0
-```
-
----
-
-### 4.9 Notification Service
-
-File:
-
-```text
-services/notification.py
-```
-
-Dùng:
-
-```python
-winsound.PlaySound(...)
-```
-
-Khi hoàn thành:
-
-```text
-target reached
-    |
-    v
-play notification
-    |
-    v
-stop bot
-```
-
-Resource:
-
-```text
-notify.wav
-```
-
----
-
-### 4.10 Resource Manager
-
-File:
-
-```text
-core/resource_manager.py
-```
-
-API:
-
-```python
-resource_path("templates/buy_bulk.png")
-resource_path("notify.wav")
-```
-
-Phải hỗ trợ:
-
-```text
-Python execution
-PyInstaller --onedir
-PyInstaller --onefile
-```
-
----
-
-## 5. Project Structure
-
-```text
-FCOnlineAutoBuy/
-│
-├── main.py
-├── config.py
-├── requirements.txt
-│
-├── ui/
-│   └── app.py
-│
-├── bot/
-│   ├── controller.py
-│   ├── state_machine.py
-│   └── counter.py
-│
-├── services/
-│   ├── screen_capture.py
-│   ├── image_detector.py
-│   ├── input_controller.py
-│   ├── ocr_service.py
-│   └── notification.py
-│
-├── core/
-│   └── resource_manager.py
-│
-├── templates/
-│   ├── buy_bulk.png
-│   ├── confirm_bulk.png
-│   ├── fco_failure_title.png
-│   ├── receive_now.png
-│   └── confirm_received.png
-│
-└── notify.wav
-```
-
----
-
-## 6. Runtime Flow
-
-```text
-User
- |
- | nhập target = 10
- |
- v
-UI
- |
- | START
- v
-Bot Controller
- |
- v
-State Machine
- |
- v
-BUY
- |
- | Image Detector
- v
-Mua hàng loạt
- |
- v
-BUY_CONFIRM
- |
- | Image Detector
- v
-Xác nhận
- |
- v
-WAIT_RESULT
- |
- +----------------------+
- |                      |
- v                      v
-FAILURE               SUCCESS
- |                      |
- | +0                   v
- v                   RECEIVE
-BUY                      |
-                        v
-                  FINAL_CONFIRM
-                        |
-                        v
-                    OCR_COUNT
-                        |
-                        v
-                  UPDATE_COUNTER
-                        |
-                        +----> purchased = 3
-                        |
-                        +----> target = 10
-                        |
-                        v
-                    BUY AGAIN
-```
-
-Khi:
-
-```text
-purchased >= target
-```
-
-thì:
-
-```text
-COMPLETED
-    |
-    v
-Notification
-    |
-    v
-STOPPED
-```
-
----
-
-## 7. Detection Strategy
-
-### Template Detection
-
-Dùng OpenCV:
-
-```python
-cv2.matchTemplate(
-    screen,
-    template,
-    cv2.TM_CCOEFF_NORMED
-)
-```
-
-Threshold mặc định:
-
-```text
-0.80 - 0.85
-```
-
-Có thể dùng threshold riêng cho những template có độ ổn định thấp.
-
-Ví dụ:
-
-```text
-BUY_THRESHOLD     = 0.85
-CONFIRM_THRESHOLD = 0.85
-RESULT_THRESHOLD  = 0.75
-```
-
-Không nên dùng một threshold cứng cho tất cả trạng thái nếu hình ảnh thực tế có độ ổn định khác nhau.
-
----
-
-## 8. OCR Strategy
-
-OCR chỉ được gọi khi:
-
-```text
-SUCCESS
-+
-FINAL_CONFIRM detected
-```
-
-Không chạy OCR liên tục khi đang chờ popup.
-
-Điều này giúp giảm thời gian xử lý.
-
-### COUNT_ROI
-
-Hiện tại vùng test thành công:
-
-```text
-COUNT_ROI = (480, 535, 950, 660)
-```
-
-Window reference:
-
-```text
-1296 x 759
-```
-
-OCR preprocessing:
-
-```text
-Crop
- ↓
-Grayscale
- ↓
-Resize x4
- ↓
-Gaussian Blur
- ↓
-Otsu Threshold
- ↓
-Tesseract
-```
-
-Ưu tiên:
-
-```text
-BINARY + PSM 6
-```
-
-sau đó fallback:
-
-```text
-GRAY + PSM 6
-```
-
-Regex:
-
-```regex
-tong\s+cong\s*(\d+)\D*cau
-```
-
-Fallback cho trường hợp OCR nhận số 1 thành ký tự:
-
-```regex
-tong\s+cong\s*([|ilI])\s*cau
-```
-
----
-
-## 9. Error Handling
-
-### Game không phản hồi
-
-Không nên:
-
-```text
-timeout -> stop bot ngay
-```
-
-Ưu tiên:
-
-```text
-check current screen
--> xác định state
--> retry state
-```
-
-### Template không tìm thấy
-
-Log:
-
-```text
-confidence
-current state
-```
-
-Ví dụ:
-
-```text
-[WAIT_RESULT]
-Failure = 0.21
-Receive = 0.63
-```
-
-### OCR fail
-
-Không crash:
-
-```text
-OCR fail
-   |
-   v
-+0
-   |
-   v
-continue
-```
-
-Có thể retry OCR một số lần giới hạn.
-
-### Stop
-
-Ở mọi state cần kiểm tra:
+Mọi vòng chờ phải kiểm tra:
 
 ```python
 stop_event.is_set()
 ```
 
-để người dùng có thể dừng bot.
-
----
-
-## 10. Threading
-
-UI thread:
+## 11. Threading
 
 ```text
-CustomTkinter
+Main thread:
+    CustomTkinter UI
+
+Worker thread:
+    queue flow
+    click
+    capture
+    OCR
+    GIF
 ```
 
-không được chạy bot trực tiếp vì OCR/OpenCV có thể block UI.
-
-Kiến trúc:
-
-```text
-Main Thread
-    |
-    +---- UI
-    |
-    +---- Bot Thread
-             |
-             +---- State Machine
-             +---- OpenCV
-             +---- OCR
-```
-
-Callback từ bot về UI:
+Worker không được cập nhật trực tiếp widget Tkinter. Log phải gửi về UI bằng:
 
 ```python
-log_callback(...)
-player_count_callback(...)
-status_callback(...)
+app.after(0, ...)
 ```
 
-UI update nên thông qua:
+## 12. Error handling
 
-```python
-app.after(...)
-```
+### Không tìm thấy game
 
----
+Không start worker và log lỗi rõ ràng.
 
-## 11. Configuration
-
-File:
+### Không đọc được giá
 
 ```text
-config.py
+log cảnh báo
+press ESC
+giữ cầu thủ hiện tại
+thử lại ở vòng kế tiếp
 ```
 
-Ví dụ:
+Không được coi lỗi OCR là giá thay đổi hoặc giá không đổi.
 
-```python
-WINDOW_TITLE = "FC ONLINE"
+### Popup không mở
 
-IMAGE_THRESHOLD = 0.85
+Không click mua hoặc nhập quantity tiếp. Đóng/khôi phục trạng thái rồi retry
+ở vòng kế tiếp.
 
-RESULT_THRESHOLD = 0.75
+### STOP
 
-CAPTURE_INTERVAL = (0.04, 0.07)
-
-CLICK_RETRY = 2
-
-COUNT_ROI = (
-    480,
-    535,
-    950,
-    660
-)
-
-NOTIFY_SOUND = "notify.wav"
-```
-
-Như vậy sau này muốn chỉnh tốc độ/threshold không phải đi sửa nhiều chỗ.
-
----
-
-## 12. Build EXE
-
-Khuyến nghị dùng PyInstaller `--onedir`.
-
-```bat
-pyinstaller ^
-  --noconfirm ^
-  --clean ^
-  --windowed ^
-  --name FCOnlineAutoBuy ^
-  --add-data "templates;templates" ^
-  --add-data "notify.wav;." ^
-  main.py
-```
-
-Output:
+STOP phải:
 
 ```text
-dist/
-└── FCOnlineAutoBuy/
-    ├── FCOnlineAutoBuy.exe
-    ├── notify.wav
-    └── templates/
-        ├── buy_bulk.png
-        ├── confirm_bulk.png
-        ├── fco_failure_title.png
-        ├── receive_now.png
-        └── confirm_received.png
+set stop_event
+worker thoát tại điểm an toàn
+không tiếp tục click hoặc nhập text
 ```
 
----
-
-## 13. Dependencies
-
-```text
-customtkinter
-opencv-python
-numpy
-Pillow
-pywin32
-pytesseract
-```
-
-Tesseract OCR engine là external dependency trên Windows.
-
-Expected path hiện tại:
-
-```text
-C:\Program Files\Tesseract-OCR\tesseract.exe
-```
-
----
-
-## 14. Design Principles
-
-### Single Responsibility
-
-Mỗi module chỉ nên có một nhiệm vụ:
-
-```text
-UI              -> UI
-Controller      -> lifecycle
-State Machine   -> flow
-Detector        -> image
-OCR             -> text/count
-Input           -> click
-Counter         -> counting
-Notification    -> sound
-Resource        -> files
-```
-
-### Image-driven
-
-Bot quyết định dựa trên:
-
-```text
-hình ảnh thực tế của game
-```
-
-không dựa chủ yếu vào:
-
-```text
-sleep 1 giây
-sleep 2 giây
-```
-
-Sleep chỉ dùng để tránh polling quá nhanh.
-
-### No round-based counting
-
-Không được:
-
-```python
-purchased_players += 1
-```
-
-Thay vào đó:
-
-```python
-count = ocr.read_purchase_count()
-purchased_players += count
-```
-
-Failure:
-
-```python
-purchased_players += 0
-```
-
-### UI độc lập với Bot
-
-UI không biết OpenCV/Tesseract hoạt động thế nào.
-
-Bot không biết layout UI.
-
-Hai bên giao tiếp qua callback/interface.
-
----
-
-## 15. Current Architecture → Target Architecture
-
-### Current
-
-```text
-app_clean_fixed.py
-        |
-        v
-auto_buy.py
-        |
-        +-- capture
-        +-- OpenCV
-        +-- click
-        +-- OCR
-        +-- counter
-        +-- notification
-        +-- state flow
-```
-
-### Target
+## 13. Files liên quan
 
 ```text
 app.py
-   |
-   v
-controller.py
-   |
-   v
-state_machine.py
-   |
-   +--> screen_capture.py
-   +--> image_detector.py
-   +--> input_controller.py
-   +--> ocr_service.py
-   +--> counter.py
-   +--> notification.py
-   +--> resource_manager.py
+    UI, parse input, sort hiển thị, profile, worker startup
+
+player_insert.py
+    queue flow, reset logic, price OCR, buy flow, GIF
+
+auto_buy.py
+    capture_fco, click_client, key_press, double_click_input, type_text
+
+profiles.json
+    profile Player Insert
+
+purchase_gifs/
+    GIF giao dịch thành công
 ```
 
-Target architecture giúp code dễ mở rộng hơn khi thêm:
+## 14. Checklist kiểm thử
 
-```text
-- Pause / Resume
-- Multiple accounts
-- Different templates
-- Sound selection
-- OCR profiles
-- Statistics
-- Export logs
-- Auto retry
-- Error screenshots
-```
-
----
-
-## 16. Recommended Next Step
-
-Không cần refactor toàn bộ ngay một lần.
-
-Thứ tự nên làm:
-
-```text
-1. Tách Resource Manager
-2. Tách Screen Capture
-3. Tách Image Detector
-4. Tách Input Controller
-5. Tách OCR Service
-6. Tách Counter
-7. Tách Notification
-8. Tách State Machine
-9. Giữ UI làm layer cuối
-```
-
-Sau khi tách xong, `auto_buy.py` hiện tại có thể được thay bằng một controller/state machine nhỏ hơn nhiều, dễ đọc và dễ debug.
+- [ ] Sort đúng reset gần nhất khi START.
+- [ ] UI đổi đúng thứ tự nhưng giữ nguyên VỊ TRÍ game.
+- [ ] Chỉ click cầu thủ thứ tự hiện tại.
+- [ ] Popup được mở bằng tọa độ nút mua cố định.
+- [ ] Giá `20.1M` được đọc đúng, không đọc `16.6M`.
+- [ ] Giá không đổi nhấn ESC và giữ nguyên cầu thủ.
+- [ ] Cầu thủ sau không được xử lý trước cầu thủ hiện tại.
+- [ ] Chuẩn bị lại giá trước reset 1 phút.
+- [ ] Chỉ thử trong 12 giây đầu mỗi phút.
+- [ ] Hết 20 phút mới chuyển cầu thủ.
+- [ ] Quantity bằng 1 không double-click ô số lượng.
+- [ ] Quantity lớn hơn 1 nhập đúng số lượng.
+- [ ] GIF có đủ 3 giây sau khi mua.
+- [ ] STOP dừng được worker.

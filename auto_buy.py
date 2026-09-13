@@ -315,7 +315,8 @@ def click_client(
     hwnd,
     image_x,
     image_y,
-    method="send"
+    method="send",
+    fast=False,
 ):
     client_x, client_y = image_to_client(
         hwnd,
@@ -345,21 +346,24 @@ def click_client(
         0,
         lparam
     )
-    random_sleep(0.025, 0.035)
+    if not fast:
+        random_sleep(0.025, 0.035)
     message(
         hwnd,
         win32con.WM_LBUTTONDOWN,
         win32con.MK_LBUTTON,
         lparam
     )
-    random_sleep(0.025, 0.035)
+    if not fast:
+        random_sleep(0.025, 0.035)
     message(
         hwnd,
         win32con.WM_LBUTTONUP,
         0,
         lparam
     )
-    random_sleep(0.045, 0.065)
+    if not fast:
+        random_sleep(0.045, 0.065)
 
 
 # ============================================================

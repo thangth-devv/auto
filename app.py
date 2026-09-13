@@ -22,7 +22,7 @@ from player_insert import normalize_reset_code, run_player_insert, sort_entries_
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("green")
 
-APP_TITLE = "AUTO BUY FCO"
+APP_TITLE = "AUTO FCO"
 APP_WIDTH = 460
 APP_HEIGHT = 660
 
@@ -1003,8 +1003,12 @@ root.pack(
 )
 
 root.grid_columnconfigure(
-    1,
+    0,
     weight=1
+)
+root.grid_columnconfigure(
+    1,
+    weight=0
 )
 
 root.grid_rowconfigure(
@@ -1033,6 +1037,7 @@ sidebar.grid(
 sidebar.grid_propagate(
     False
 )
+sidebar.grid_remove()
 
 
 # ============================================================
@@ -1231,8 +1236,21 @@ def open_player_insert():
     if player_insert_window is not None and player_insert_window.winfo_exists():
         return
 
+    auto_buy_tab.configure(
+        fg_color="transparent",
+        text_color=MUTED,
+    )
+    player_insert_tab.configure(
+        fg_color="transparent",
+        text_color=GREEN,
+    )
+    auto_buy_indicator.configure(fg_color="transparent")
+    player_insert_indicator.configure(fg_color=GREEN)
+
     player_insert_layout = []
     for widget in main.winfo_children():
+        if widget is topbar:
+            continue
         player_insert_layout.append((widget, widget.pack_info()))
         widget.pack_forget()
 
@@ -1243,13 +1261,25 @@ def open_player_insert():
     )
     player_insert_window.pack(fill="both", expand=True)
 
-    title = ctk.CTkLabel(
+    title_bar = ctk.CTkFrame(
         player_insert_window,
+        fg_color="transparent",
+    )
+    title_bar.pack(fill="x", padx=18, pady=(12, 4))
+    title_bar.grid_columnconfigure(0, weight=1)
+    title_bar.grid_columnconfigure(1, weight=1)
+    title_bar.grid_columnconfigure(2, weight=1)
+    ctk.CTkLabel(
+        title_bar,
         text="CHÈN CẦU THỦ THEO GIỜ RESET",
         text_color=GREEN,
         font=ctk.CTkFont(size=16, weight="bold"),
+    ).grid(row=0, column=1)
+    profile_actions = ctk.CTkFrame(
+        title_bar,
+        fg_color="transparent",
     )
-    title.pack(pady=(16, 4))
+    profile_actions.grid(row=0, column=2, sticky="e")
 
     ctk.CTkLabel(
         player_insert_window,
@@ -1317,6 +1347,34 @@ def open_player_insert():
     def log_player(message):
         print(message)
         app.after(0, lambda: (log_box.insert("end", message + "\n"), log_box.see("end")))
+
+    def save_player_insert_profile():
+        profile_rows = []
+        for position_entry, reset_entry, quantity_entry in row_controls:
+            profile_rows.append({
+                "position": position_entry.get(),
+                "reset": reset_entry.get(),
+                "quantity": quantity_entry.get(),
+            })
+        profiles["player_insert"] = profile_rows
+        if save_profiles():
+            log_player("💾 Đã lưu profile Player Insert.")
+
+    def load_player_insert_profile():
+        profile_rows = profiles.get("player_insert")
+        if not isinstance(profile_rows, list):
+            log_player("ℹ️ Chưa có profile Player Insert đã lưu.")
+            return
+        for controls, saved_row in zip(row_controls, profile_rows):
+            if not isinstance(saved_row, dict):
+                continue
+            for field, key in zip(
+                controls,
+                ("position", "reset", "quantity"),
+            ):
+                field.delete(0, "end")
+                field.insert(0, str(saved_row.get(key, "")))
+        log_player("📂 Đã tải profile Player Insert.")
 
     def stop_player_insert():
         if player_insert_stop_event is not None:
@@ -1425,7 +1483,33 @@ def open_player_insert():
         )
         player_insert_thread.start()
 
-    button_row = ctk.CTkFrame(player_insert_window, fg_color="transparent")
+    ctk.CTkButton(
+        profile_actions,
+        text="💾",
+        command=save_player_insert_profile,
+        width=30,
+        height=26,
+        fg_color="#313A42",
+        hover_color="#3C4750",
+        corner_radius=7,
+        font=ctk.CTkFont(size=13),
+    ).pack(side="left", padx=(0, 4))
+    ctk.CTkButton(
+        profile_actions,
+        text="📂",
+        command=load_player_insert_profile,
+        width=30,
+        height=26,
+        fg_color="#313A42",
+        hover_color="#3C4750",
+        corner_radius=7,
+        font=ctk.CTkFont(size=13),
+    ).pack(side="left")
+
+    button_row = ctk.CTkFrame(
+        player_insert_window,
+        fg_color="transparent",
+    )
     button_row.pack(fill="x", padx=18, pady=(0, 16))
     start_button = ctk.CTkButton(
         button_row, text="▶ START", command=start_player_insert,
@@ -1439,12 +1523,25 @@ def open_player_insert():
     )
     stop_button.pack(side="left", expand=True, padx=5)
 
+    load_player_insert_profile()
+
 
 def show_auto_buy():
     global player_insert_window, player_insert_layout
 
     if player_insert_window is None or not player_insert_window.winfo_exists():
         return
+
+    auto_buy_tab.configure(
+        fg_color="transparent",
+        text_color=GREEN,
+    )
+    player_insert_tab.configure(
+        fg_color="transparent",
+        text_color=MUTED,
+    )
+    auto_buy_indicator.configure(fg_color=GREEN)
+    player_insert_indicator.configure(fg_color="transparent")
 
     if player_insert_stop_event is not None:
         player_insert_stop_event.set()
@@ -1459,12 +1556,6 @@ def show_auto_buy():
 
 def _reset_matches_hour_for_ui(reset_code):
     return normalize_reset_code(reset_code)
-
-
-sidebar_item(
-    "♟",
-    command=open_player_insert
-)
 
 
 # ============================================================
@@ -1497,7 +1588,7 @@ main = ctk.CTkFrame(
 
 main.grid(
     row=0,
-    column=1,
+    column=0,
     sticky="nsew",
     padx=10,
     pady=8
@@ -1523,19 +1614,67 @@ topbar.pack_propagate(
 )
 
 
-ctk.CTkLabel(
+auto_buy_tab_wrap = ctk.CTkFrame(
     topbar,
-    text="AUTO BUY",
-    text_color=GREEN,
-    font=ctk.CTkFont(
-        size=18,
-        weight="bold"
-    )
-).pack(
-    side="left",
-    padx=(12, 0),
-    pady=(5, 0)
+    width=145,
+    height=34,
+    fg_color="transparent",
+    corner_radius=0,
 )
+auto_buy_tab_wrap.pack(side="left", padx=(20, 0), pady=7)
+auto_buy_tab_wrap.pack_propagate(False)
+
+auto_buy_tab = ctk.CTkButton(
+    auto_buy_tab_wrap,
+    text="Mua phôi",
+    command=show_auto_buy,
+    width=145,
+    height=29,
+    fg_color="transparent",
+    hover_color="#1B1F24",
+    text_color=GREEN,
+    corner_radius=0,
+    border_width=0,
+)
+auto_buy_tab.pack(fill="x")
+auto_buy_indicator = ctk.CTkFrame(
+    auto_buy_tab_wrap,
+    height=2,
+    fg_color=GREEN,
+    corner_radius=0,
+)
+auto_buy_indicator.pack(fill="x", padx=8, side="bottom")
+
+player_insert_tab_wrap = ctk.CTkFrame(
+    topbar,
+    width=155,
+    height=34,
+    fg_color="transparent",
+    corner_radius=0,
+)
+player_insert_tab_wrap.pack(side="left", padx=0, pady=7)
+player_insert_tab_wrap.pack_propagate(False)
+
+player_insert_tab = ctk.CTkButton(
+    player_insert_tab_wrap,
+    text="Chèn cầu thủ",
+    command=open_player_insert,
+    width=155,
+    height=29,
+    fg_color="transparent",
+    hover_color="#1B1F24",
+    text_color=MUTED,
+    corner_radius=0,
+    border_width=0,
+)
+player_insert_tab.pack(fill="x")
+player_insert_indicator = ctk.CTkFrame(
+    player_insert_tab_wrap,
+    height=2,
+    fg_color="transparent",
+    corner_radius=0,
+)
+player_insert_indicator.pack(fill="x", padx=8, side="bottom")
 
 
 ready_badge = ctk.CTkFrame(
@@ -1543,14 +1682,14 @@ ready_badge = ctk.CTkFrame(
     fg_color="#0C2318",
     border_width=1,
     border_color="#1B6740",
-    corner_radius=10,
-    width=120,
-    height=34
+    corner_radius=8,
+    width=78,
+    height=26
 )
 
 ready_badge.pack(
     side="right",
-    pady=8
+    pady=11
 )
 
 ready_badge.pack_propagate(
@@ -1560,10 +1699,10 @@ ready_badge.pack_propagate(
 
 ctk.CTkLabel(
     ready_badge,
-    text="●  READY",
+    text="● READY",
     text_color=GREEN,
     font=ctk.CTkFont(
-        size=10,
+        size=8,
         weight="bold"
     )
 ).pack(
