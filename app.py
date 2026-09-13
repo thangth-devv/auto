@@ -12,6 +12,7 @@ import re
 from PIL import Image, ImageTk
 
 from auto_buy import run_auto_buy
+from player_insert import normalize_reset_code, run_player_insert, sort_entries_by_reset
 
 
 # ============================================================
@@ -49,6 +50,10 @@ stop_event = None
 is_running = False
 current_hwnd = None
 start_time = None
+player_insert_window = None
+player_insert_thread = None
+player_insert_stop_event = None
+player_insert_layout = None
 
 
 # ============================================================
@@ -1108,16 +1113,31 @@ else:
 # SIDEBAR ITEMS
 # ============================================================
 
-def sidebar_item(
-    icon,
-    active=False
-):
+sidebar_items = []
+
+
+def set_active_sidebar_item(selected_frame):
+    for item in sidebar_items:
+        is_selected = item["frame"] is selected_frame
+        item["selected"] = is_selected
+        item["frame"].configure(
+            fg_color="#0D281B" if is_selected else "transparent",
+            border_width=1 if is_selected else 0,
+            border_color="#1C7546",
+        )
+        item["label"].configure(
+            text_color=GREEN if is_selected else MUTED
+        )
+
+
+def sidebar_item(icon, active=False, command=None):
 
     frame = ctk.CTkFrame(
         sidebar,
         width=44,
         height=40,
         corner_radius=14,
+        cursor="hand2",
         fg_color=(
             "#0D281B"
             if active
@@ -1140,9 +1160,10 @@ def sidebar_item(
         False
     )
 
-    ctk.CTkLabel(
+    label = ctk.CTkLabel(
         frame,
         text=icon,
+        cursor="hand2",
         text_color=(
             GREEN
             if active
@@ -1152,24 +1173,297 @@ def sidebar_item(
             size=14,
             weight="bold"
         )
-    ).pack(
+    )
+
+    label.pack(
         expand=True
     )
+
+    item = {
+        "frame": frame,
+        "label": label,
+        "selected": active,
+    }
+    sidebar_items.append(item)
+
+    def select_item(_event=None):
+        set_active_sidebar_item(frame)
+        if command is not None:
+            command()
+        return "break"
+
+    def on_enter(_event=None):
+        frame.configure(
+            fg_color="#163D29",
+            border_width=1,
+            border_color="#1C7546",
+        )
+        label.configure(text_color=GREEN_HOVER)
+
+    def on_leave(_event=None):
+        is_selected = item["selected"]
+        frame.configure(
+            fg_color="#0D281B" if is_selected else "transparent",
+            border_width=1 if is_selected else 0,
+            border_color="#1C7546",
+        )
+        label.configure(text_color=GREEN if is_selected else MUTED)
+
+    frame.bind("<Button-1>", select_item)
+    label.bind("<Button-1>", select_item)
+    frame.bind("<Enter>", on_enter)
+    frame.bind("<Leave>", on_leave)
+    label.bind("<Enter>", on_enter)
+    label.bind("<Leave>", on_leave)
 
     return frame
 
 
 sidebar_item(
     "⌂",
-    active=True
+    active=True,
+    command=lambda: show_auto_buy()
 )
 
-sidebar_item(
-    "⚙"
-)
+def open_player_insert():
+    global player_insert_window, player_insert_layout
+
+    if player_insert_window is not None and player_insert_window.winfo_exists():
+        return
+
+    player_insert_layout = []
+    for widget in main.winfo_children():
+        player_insert_layout.append((widget, widget.pack_info()))
+        widget.pack_forget()
+
+    player_insert_window = ctk.CTkFrame(
+        main,
+        fg_color="transparent",
+        corner_radius=0,
+    )
+    player_insert_window.pack(fill="both", expand=True)
+
+    title = ctk.CTkLabel(
+        player_insert_window,
+        text="CHÈN CẦU THỦ THEO GIỜ RESET",
+        text_color=GREEN,
+        font=ctk.CTkFont(size=16, weight="bold"),
+    )
+    title.pack(pady=(16, 4))
+
+    ctk.CTkLabel(
+        player_insert_window,
+        text="Trong 20 phút đầu giờ, chỉ xử lý 12 giây đầu mỗi phút.",
+        text_color=MUTED,
+        font=ctk.CTkFont(size=9),
+    ).pack(pady=(0, 10))
+
+    header = ctk.CTkFrame(player_insert_window, fg_color="transparent")
+    header.pack(fill="x", padx=18)
+    ctk.CTkLabel(header, text="THỨ TỰ", width=55, text_color=MUTED).pack(side="left")
+    ctk.CTkLabel(header, text="VỊ TRÍ", width=90, text_color=MUTED).pack(side="left")
+    ctk.CTkLabel(header, text="RESET", width=90, text_color=MUTED).pack(side="left")
+    ctk.CTkLabel(header, text="SL", width=45, text_color=MUTED).pack(side="left")
+
+    rows_frame = ctk.CTkFrame(player_insert_window, fg_color=CARD)
+    rows_frame.pack(fill="both", expand=False, padx=12)
+    row_controls = []
+    row_widgets = []
+
+    def limit_entry_length(entry, maximum):
+        value = entry.get()
+        if len(value) > maximum:
+            entry.delete(maximum, "end")
+
+    for row_number in range(1, 11):
+        row = ctk.CTkFrame(rows_frame, fg_color="transparent")
+        row.pack(fill="x", pady=1)
+        row_label = ctk.CTkLabel(row, text=str(row_number), width=55)
+        row_label.pack(side="left")
+        position = ctk.CTkEntry(
+            row,
+            width=90,
+            height=26,
+            placeholder_text="1-10",
+        )
+        position.pack(side="left", padx=(0, 8))
+        position.bind(
+            "<KeyRelease>",
+            lambda _event, field=position: limit_entry_length(field, 2),
+        )
+        reset = ctk.CTkEntry(row, width=90, height=26)
+        reset.pack(side="left", padx=(0, 8))
+        reset.bind(
+            "<KeyRelease>",
+            lambda _event, field=reset: limit_entry_length(field, 3),
+        )
+        quantity = ctk.CTkEntry(
+            row,
+            width=45,
+            height=26,
+            placeholder_text="1",
+        )
+        quantity.pack(side="left")
+        quantity.bind(
+            "<KeyRelease>",
+            lambda _event, field=quantity: limit_entry_length(field, 2),
+        )
+        row_controls.append((position, reset, quantity))
+        row_widgets.append((row, row_label))
+
+    log_box = ctk.CTkTextbox(player_insert_window, height=100)
+    log_box.pack(fill="both", expand=True, padx=18, pady=(8, 8))
+
+    def log_player(message):
+        print(message)
+        app.after(0, lambda: (log_box.insert("end", message + "\n"), log_box.see("end")))
+
+    def stop_player_insert():
+        if player_insert_stop_event is not None:
+            player_insert_stop_event.set()
+
+    def start_player_insert():
+        global player_insert_thread, player_insert_stop_event
+        if player_insert_thread is not None and player_insert_thread.is_alive():
+            log_player("⚠️ Player Insert đang chạy.")
+            return
+        hwnd = find_fc_online()
+        if hwnd is None:
+            log_player("❌ Không tìm thấy FC ONLINE.")
+            return
+
+        entries = []
+        try:
+            for row_number, (
+                position_entry,
+                reset_entry,
+                quantity_entry,
+            ) in enumerate(row_controls, 1):
+                position_text = position_entry.get().strip()
+                reset_text = reset_entry.get().strip().lower()
+                quantity_text = quantity_entry.get().strip()
+                if not position_text and not reset_text and not quantity_text:
+                    continue
+                try:
+                    position = int(position_text)
+                except ValueError as exc:
+                    raise ValueError(
+                        f"Dòng {row_number}: Vị trí phải là số từ 1 đến 10."
+                    ) from exc
+                if position < 1 or position > 10:
+                    raise ValueError("Vị trí phải từ 1 đến 10.")
+                reset_text = _reset_matches_hour_for_ui(reset_text)
+                try:
+                    quantity = int(quantity_text or "1")
+                except ValueError as exc:
+                    raise ValueError(
+                        f"Dòng {row_number}: Số lượng phải là số nguyên."
+                    ) from exc
+                if quantity < 1:
+                    raise ValueError("Số lượng phải từ 1 trở lên.")
+                entries.append((
+                    row_number,
+                    {
+                        "position": position,
+                        "reset": reset_text,
+                        "quantity": quantity,
+                    },
+                ))
+        except ValueError as exc:
+            log_player(f"❌ Cấu hình không hợp lệ: {exc}")
+            return
+
+        if not entries:
+            log_player("❌ Cần nhập ít nhất một cầu thủ.")
+            return
+
+        sorted_entries = sort_entries_by_reset(entries)
+        for display_row, (_source_row, entry) in enumerate(sorted_entries, 1):
+            position_entry, reset_entry, quantity_entry = row_controls[display_row - 1]
+            position_entry.delete(0, "end")
+            position_entry.insert(0, str(entry["position"]))
+            reset_entry.delete(0, "end")
+            reset_entry.insert(0, entry["reset"])
+            quantity_entry.delete(0, "end")
+            quantity_entry.insert(0, str(entry["quantity"]))
+
+        for display_row in range(len(sorted_entries) + 1, len(row_controls) + 1):
+            for entry in row_controls[display_row - 1]:
+                entry.delete(0, "end")
+
+        entries = [
+            (display_row, entry)
+            for display_row, (_source_row, entry) in enumerate(sorted_entries, 1)
+        ]
+
+        player_insert_stop_event = threading.Event()
+        log_box.delete("1.0", "end")
+
+        start_button.configure(state="disabled")
+        stop_button.configure(state="normal")
+
+        def player_insert_worker():
+            try:
+                run_player_insert(
+                    hwnd,
+                    entries,
+                    player_insert_stop_event,
+                    log_player,
+                )
+            finally:
+                app.after(
+                    0,
+                    lambda: (
+                        start_button.configure(state="normal"),
+                        stop_button.configure(state="disabled"),
+                    ),
+                )
+
+        player_insert_thread = threading.Thread(
+            target=player_insert_worker,
+            daemon=True,
+        )
+        player_insert_thread.start()
+
+    button_row = ctk.CTkFrame(player_insert_window, fg_color="transparent")
+    button_row.pack(fill="x", padx=18, pady=(0, 16))
+    start_button = ctk.CTkButton(
+        button_row, text="▶ START", command=start_player_insert,
+        fg_color="#16B95D", hover_color=GREEN_HOVER, width=150
+    )
+    start_button.pack(side="left", expand=True, padx=(0, 5))
+    stop_button = ctk.CTkButton(
+        button_row, text="■ STOP", command=stop_player_insert,
+        fg_color="#313A42", hover_color="#3C4750", width=100,
+        state="disabled",
+    )
+    stop_button.pack(side="left", expand=True, padx=5)
+
+
+def show_auto_buy():
+    global player_insert_window, player_insert_layout
+
+    if player_insert_window is None or not player_insert_window.winfo_exists():
+        return
+
+    if player_insert_stop_event is not None:
+        player_insert_stop_event.set()
+
+    player_insert_window.destroy()
+    player_insert_window = None
+
+    if player_insert_layout is not None:
+        for widget, layout in player_insert_layout:
+            widget.pack(**layout)
+        player_insert_layout = None
+
+def _reset_matches_hour_for_ui(reset_code):
+    return normalize_reset_code(reset_code)
+
 
 sidebar_item(
-    "ⓘ"
+    "♟",
+    command=open_player_insert
 )
 
 

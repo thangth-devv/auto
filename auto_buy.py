@@ -587,6 +587,12 @@ def double_click_input(hwnd, image_x, image_y):
         win32con.MK_LBUTTON,
         lparam
     )
+    win32gui.SendMessage(
+        hwnd,
+        win32con.WM_LBUTTONDBLCLK,
+        win32con.MK_LBUTTON,
+        lparam
+    )
     random_sleep(0.05, 0.08)
     win32gui.SendMessage(
         hwnd,
@@ -655,6 +661,35 @@ def set_filter_by_double_click(
     )
 
 
+def normalize_numeric_text(value):
+    """Bỏ ký tự không phải số để so sánh OCR ổn định hơn."""
+    if value is None:
+        return ""
+    return "".join(char for char in str(value) if char.isdigit())
+
+
+def numeric_match(actual, expected):
+    """So khớp số OCR theo kiểu khinh khích, tránh lỗi viền/extra digit."""
+    actual_text = normalize_numeric_text(actual)
+    expected_text = normalize_numeric_text(expected)
+
+    if not actual_text or not expected_text:
+        return False
+
+    if actual_text == expected_text:
+        return True
+
+    # Tesseract đôi khi đọc nhầm 124 thành 1240/1242 hoặc ghép thêm 0 ở cuối.
+    # Nếu giá trị nghe có vẻ cùng mang một chuỗi số cốt lõi, coi là khớp.
+    if len(actual_text) >= len(expected_text) and actual_text.startswith(expected_text):
+        return True
+
+    if len(expected_text) >= len(actual_text) and expected_text.startswith(actual_text):
+        return True
+
+    return False
+
+
 def read_filter_value(
     hwnd,
     image_x,
@@ -703,9 +738,9 @@ def read_filter_value(
                 config="--psm 7 -c tessedit_char_whitelist=0123456789",
                 lang="eng"
             )
-            value = "".join(char for char in text if char.isdigit())
+            value = normalize_numeric_text(text)
             if value:
-                if expected is not None and value == expected:
+                if expected is not None and numeric_match(value, expected):
                     return value
                 candidates.append(value)
 
@@ -762,7 +797,7 @@ def set_filter_with_verification(
             roi_half_width=verification_roi_half_width
         )
 
-        if actual == expected:
+        if numeric_match(actual, expected):
             log_message(
                 f"    ✅ Đã xác minh '{label}': {actual}",
                 log_callback
@@ -787,7 +822,7 @@ def set_filter_with_verification(
             expected=actual,
             roi_half_width=verification_roi_half_width
         )
-        if confirmed_actual != actual:
+        if not numeric_match(confirmed_actual, actual):
             log_message(
                 f"    ⚠️ OCR chưa ổn định cho '{label}'; "
                 "giữ giá trị vừa nhập.",
@@ -1035,33 +1070,47 @@ def click_failure_confirm(
         width = right - left
         height = bottom - top
 
-        x = int(width * 0.561)
-        y = int(height * 0.604)
+        candidate_positions = [
+            (int(width * 0.561), int(height * 0.604)),
+            (int(width * 0.546), int(height * 0.598)),
+            (int(width * 0.571), int(height * 0.619)),
+            (int(width * 0.535), int(height * 0.610)),
+            (int(width * 0.585), int(height * 0.591))
+        ]
 
-        log_message(
-            "⚠️ Cả 2 pattern Xác nhận không match "
-            f"→ fallback click ({x},{y})",
-            log_callback
-        )
+        for x, y in candidate_positions:
+            try:
+                log_message(
+                    "⚠️ Cả 2 pattern Xác nhận không match "
+                    f"→ fallback click ({x},{y})",
+                    log_callback
+                )
 
-        click_client(
-            hwnd,
-            x,
-            y,
-            method="send"
-        )
+                click_client(
+                    hwnd,
+                    x,
+                    y,
+                    method="send"
+                )
 
-        random_sleep(
-            0.10,
-            0.16
-        )
+                random_sleep(
+                    0.08,
+                    0.12
+                )
 
-        log_message(
-            "✅ Đã gửi click Xác nhận fallback.",
-            log_callback
-        )
+                log_message(
+                    "✅ Đã gửi click Xác nhận fallback.",
+                    log_callback
+                )
 
-        return True
+                return True
+            except Exception as exc:
+                log_message(
+                    f"❌ Fallback click Xác nhận thất bại ở ({x},{y}): {exc}",
+                    log_callback
+                )
+
+        return False
 
     except Exception as exc:
 
