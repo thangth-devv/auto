@@ -10,9 +10,10 @@ Player Insert tự động chèn cầu thủ theo giờ reset trong FC Online:
 - Chọn cầu thủ bằng **VỊ TRÍ** trong game.
 - Dùng **THỨ TỰ** để xác định cầu thủ nào được xử lý trước.
 - Đọc giá tối đa sau khi mở popup `Mua cầu thủ`.
-- Mua khi giá thay đổi.
+- Ghi nhớ một giá mốc cho từng thời điểm reset.
+- Mua chỉ khi giá trong popup khác giá ghi nhớ.
 - Nhấn `ESC` khi giá chưa đổi.
-- Lưu GIF trong 3 giây sau khi mua thành công.
+- Chờ popup đóng rồi mới xác nhận mua thành công và phát thông báo.
 
 ## 2. Khái niệm dữ liệu
 
@@ -171,91 +172,94 @@ SORT_QUEUE
 SELECT_CURRENT_PLAYER
   |
   v
+WAIT_FOR_RESET
+  |
+  v
+READ_RESET_BASE_PRICE (một lần)
+  |
+  v
+RESET_WINDOW
+  |
+  v
 OPEN_BUY_POPUP
   |
   v
-READ_BASE_PRICE
+READ_CURRENT_PRICE
   |
-  v
-CLOSE_POPUP
-  |
-  +--> WAIT_FOR_RESET
-  |       |
-  |       +--> PREPARE_ONE_MINUTE_BEFORE_RESET
-  |       |       |
-  |       |       +--> READ_BASE_PRICE
-  |       |
-  |       +--> RESET_WINDOW
-  |               |
-  |               v
-  |          OPEN_BUY_POPUP
-  |               |
-  |               v
-  |          READ_CURRENT_PRICE
-  |               |
-  |       +-------+-------+
-  |       |               |
-  |   PRICE_CHANGED   PRICE_UNCHANGED
-  |       |               |
-  |       v               v
-  |   BUY_PLAYER       PRESS_ESC
-  |       |               |
-  |       v               |
-  |   RECORD_GIF          |
-  |       |               |
-  |       +-------+-------+
-  |               |
-  |               v
-  |        NEXT_QUEUE_ITEM
-  |
-  +--> AFTER_20_MINUTES_UNCHANGED
-              |
-              v
-       NEXT_QUEUE_ITEM
++-------------------+
+|                   |
+PRICE_UNCHANGED   PRICE_CHANGED
+|                   |
+v                   v
+PRESS_ESC       SELECT_MAX_PRICE
+|                   |
+|             quantity > 1?
+|                   |
+|          +--------+--------+
+|          |                 |
+|         YES               NO
+|          |                 |
+|    INPUT_QUANTITY     BUY_PLAYER
+|          |                 |
+|          +--------> BUY_PLAYER
+|                            |
+|                    WAIT_POPUP_CLOSE
+|                            |
+|                  +---------+---------+
+|                  |                   |
+|               CLOSED             TIMEOUT
+|                  |                   |
+|             NOTIFY              WARN_ONLY
+|                  |
++------------------+
+          |
+   retry in same reset
+          |
+   reset window ends
+          |
+   NEXT_QUEUE_ITEM
 ```
 
 ## 6. Flow chi tiết
 
-### 6.1 START
+### 6.1 Bắt đầu xử lý cầu thủ
 
 ```text
-START
- -> parse configuration
- -> sort by nearest reset
- -> update UI
- -> select first queue item
- -> click game position
- -> click Mua cầu thủ
- -> capture screen
- -> read Giá tối đa
- -> log and store base price
+select current player
+ -> press ESC and confirm stale popup is closed
+ -> nếu không đóng được popup: cảnh báo và dừng an toàn
+ -> click configured player position
+ -> chờ game cập nhật vị trí đã chọn
+ -> chờ cửa sổ reset
+ -> khi bắt đầu reset, mở popup Mua cầu thủ
+ -> đọc Giá tối đa đúng một lần
+ -> lưu reset_at và reset_base_price
  -> press ESC
 ```
 
-Không đọc giá trước khi mở popup mua.
+Nếu đang ở giữa cửa sổ reset còn hiệu lực, phải dùng đúng `reset_at` của
+reset đã bắt đầu, kể cả khi reset đi qua giờ tiếp theo. Không được nhảy sang
+reset kế tiếp chỉ vì `now.hour` đã thay đổi.
 
-### 6.2 Chuẩn bị trước reset
+### 6.2 Ghi nhớ giá theo reset
 
-Với cầu thủ hiện tại, nếu còn không quá 60 giây đến reset:
+Mỗi thời điểm reset có một giá ghi nhớ riêng:
 
 ```text
-click lại vị trí hiện tại
- -> click Mua cầu thủ
- -> read Giá tối đa
- -> cập nhật base price
- -> press ESC
- -> chờ giờ reset
+reset_base_price = giá đọc tại đầu cửa sổ reset
 ```
 
-Chỉ chuẩn bị một lần cho mỗi thời điểm reset.
+Trong suốt 20 phút của cửa sổ đó, `reset_base_price` không được cập nhật lại.
+Khi cửa sổ kết thúc và bước sang reset mới, bot đọc giá mới một lần và thay thế
+giá ghi nhớ cũ.
 
 ### 6.3 Cửa sổ reset
 
-Cửa sổ xử lý kéo dài 20 phút kể từ reset. Chỉ thử trong 12 giây đầu mỗi phút:
+Cửa sổ xử lý kéo dài 20 phút kể từ reset. Chỉ thử trong 15 giây đầu mỗi phút:
 
 ```text
-reset_minute <= current_minute < reset_minute + 20
-current_second < 12
+reset_at <= current_time < reset_at + 20 minutes
+current_second < 15
 ```
 
 Mỗi lần thử:
@@ -265,6 +269,7 @@ click Mua cầu thủ
  -> chờ popup render tối thiểu
  -> capture_fco(hwnd)
  -> OCR Giá tối đa
+ -> so sánh với reset_base_price
 ```
 
 ### 6.4 Giá không đổi
@@ -272,7 +277,7 @@ click Mua cầu thủ
 Nếu:
 
 ```python
-current_price == base_price
+current_price == reset_base_price
 ```
 
 thì:
@@ -291,7 +296,7 @@ cửa sổ reset.
 Nếu:
 
 ```python
-current_price != base_price
+current_price != reset_base_price
 ```
 
 thì:
@@ -317,10 +322,16 @@ click Mua cầu thủ
 Sau đó:
 
 ```text
-capture frame trong 3 giây
+chờ popup mua biến mất ổn định
+ -> nếu popup chưa đóng trong timeout: cảnh báo, chưa xác nhận mua
+ -> nếu popup đã đóng: ghi nhận thành công
+ -> phát thông báo
  -> save GIF
  -> chuyển sang queue item kế tiếp
 ```
+
+Không được click dòng giá tối đa, nhập quantity hoặc click mua khi
+`current_price == reset_base_price`.
 
 ## 7. Price OCR
 
@@ -361,8 +372,8 @@ scale tương ứng.
 
 ```text
 18.3M -> 18,300,000
-20.1M -> 20,100,000
-1.2B  -> 1,200,000,000
+20.1M / 20,1M -> 20,100,000
+1.2B / 1,2B  -> 1,200,000,000
 ```
 
 Hiển thị log:
@@ -373,11 +384,15 @@ Hiển thị log:
 1.2B
 ```
 
+OCR phải giữ dấu phân cách thập phân mà game hiển thị (`.` hoặc `,`).
+Không được bỏ dấu này vì `24,2M` phải được đọc là `24.2M`, không phải `242M`.
 Không được suy diễn giá từ số trong ô nhập `20.100.000`.
+Nếu các lần OCR trên cùng ROI cho nhiều kết quả khác nhau, chọn giá trị có
+nhiều kết quả đồng thuận nhất; không chọn giá trị lớn nhất.
 
 ## 8. GIF recorder
 
-GIF bắt đầu khi giá đã thay đổi và kết thúc sau thao tác mua:
+GIF bắt đầu khi giá đã thay đổi và kết thúc sau khi popup đóng:
 
 ```text
 price changed
@@ -385,7 +400,7 @@ price changed
  -> click giá tối đa
  -> nhập quantity nếu cần
  -> click Mua cầu thủ
- -> capture tiếp trong 3 giây
+ -> capture cho đến khi popup đóng ổn định
  -> save GIF
 ```
 
@@ -403,21 +418,33 @@ position_{position}_{reset}_{timestamp}.gif
 
 GIF chỉ được tạo cho lần mua có giá thay đổi.
 
+Sau khi phát hiện giá đã reset và bot click vào hàng `Giá tối đa`, bot lưu
+ảnh crop quanh tọa độ click, có đánh dấu điểm click bằng dấu đỏ. Ảnh được lưu
+trong thư mục:
+
+```text
+ocr_debug/
+```
+
+Mỗi lần giá đã reset, bot lưu một ảnh sau khi click vào tọa độ cố định giữa
+dòng giá tối đa để kiểm tra trực quan.
+
 ## 9. Logging
 
 Log phải phân biệt thứ tự xử lý và vị trí game:
 
 ```text
 [Thứ tự 1][Vị trí 5] Đang chọn cầu thủ.
-[Thứ tự 1][Vị trí 5] Giá max mốc: 18.3M.
-[Thứ tự 1][Vị trí 5] Giá hiện tại: 20.1M.
-[Thứ tự 1][Vị trí 5] Đã gửi lệnh mua 10 cầu thủ.
+[Thứ tự 1][Vị trí 5] Giá ghi nhớ reset: 18.3M.
+[Thứ tự 1][Vị trí 5] Giá trên game: 20.1M.
+[Thứ tự 1][Vị trí 5] Đã mua được 10 cầu thủ với giá 20.1M/cầu thủ.
 [Thứ tự 1][Vị trí 5] Đã lưu GIF: ...
 ```
 
 Khi giá không đổi:
 
 ```text
+[Thứ tự 1][Vị trí 5] Giá ghi nhớ: 24.2M; giá trên game: 24.2M.
 [Thứ tự 1][Vị trí 5] Giá không đổi; nhấn ESC và thử lại.
 ```
 
@@ -433,13 +460,17 @@ Các hằng số:
 
 ```python
 PLAYER_SELECTION_WAIT
-PRICE_DIALOG_WAIT
+PRICE_DIALOG_TIMEOUT
+POPUP_CLOSE_BEFORE_SELECTION_TIMEOUT
 GIF_CAPTURE_INTERVAL
-GIF_RETURN_WAIT = 3.0
+POPUP_CLOSE_TIMEOUT
+POPUP_CLOSE_STABLE_READS
 ```
 
-Không dùng thời gian chờ dài cố định. Chỉ dùng delay tối thiểu để popup kịp
-render trước khi capture.
+`PLAYER_SELECTION_WAIT` dùng để chờ game cập nhật vị trí sau khi click.
+`POPUP_CLOSE_BEFORE_SELECTION_TIMEOUT` dùng để xác nhận popup cũ đã đóng trước
+khi click vị trí mới. `PRICE_DIALOG_TIMEOUT` chỉ chờ popup mua xuất hiện.
+Không được đọc giá hoặc click mua khi popup cũ chưa được xác nhận đóng.
 
 Mọi vòng chờ phải kiểm tra:
 
@@ -489,6 +520,20 @@ Không được coi lỗi OCR là giá thay đổi hoặc giá không đổi.
 Không click mua hoặc nhập quantity tiếp. Đóng/khôi phục trạng thái rồi retry
 ở vòng kế tiếp.
 
+### Popup cũ chưa đóng
+
+Trước khi chọn một vị trí mới:
+
+```text
+press ESC
+ -> capture màn hình
+ -> xác nhận vùng popup không còn sáng
+ -> chỉ khi xác nhận đóng mới click vị trí
+```
+
+Nếu hết timeout mà popup vẫn còn, log cảnh báo và dừng an toàn để không đọc
+nhầm giá của cầu thủ trước.
+
 ### STOP
 
 STOP phải:
@@ -523,14 +568,20 @@ purchase_gifs/
 - [ ] Sort đúng reset gần nhất khi START.
 - [ ] UI đổi đúng thứ tự nhưng giữ nguyên VỊ TRÍ game.
 - [ ] Chỉ click cầu thủ thứ tự hiện tại.
+- [ ] Popup cũ được đóng và xác nhận trước khi click vị trí mới.
+- [ ] Không đọc giá mốc khi vị trí mới chưa được cập nhật.
 - [ ] Popup được mở bằng tọa độ nút mua cố định.
 - [ ] Giá `20.1M` được đọc đúng, không đọc `16.6M`.
 - [ ] Giá không đổi nhấn ESC và giữ nguyên cầu thủ.
 - [ ] Cầu thủ sau không được xử lý trước cầu thủ hiện tại.
-- [ ] Chuẩn bị lại giá trước reset 1 phút.
+- [ ] Đọc và lưu giá đúng một lần ở đầu mỗi reset.
+- [ ] Không cập nhật giá ghi nhớ trong cùng cửa sổ reset.
+- [ ] Giá đi qua giờ tiếp theo vẫn giữ đúng cửa sổ reset cũ.
 - [ ] Chỉ thử trong 12 giây đầu mỗi phút.
 - [ ] Hết 20 phút mới chuyển cầu thủ.
+- [ ] Giá trên game bằng giá ghi nhớ thì không mua.
 - [ ] Quantity bằng 1 không double-click ô số lượng.
 - [ ] Quantity lớn hơn 1 nhập đúng số lượng.
-- [ ] GIF có đủ 3 giây sau khi mua.
+- [ ] Chỉ phát thông báo sau khi popup đóng.
+- [ ] Popup không đóng thì không xác nhận mua thành công.
 - [ ] STOP dừng được worker.

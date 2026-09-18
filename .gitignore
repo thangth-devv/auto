@@ -3,3 +3,5 @@ profiles.json
 dist
 build
 tesseract
+ocr_debug
+purchase_gifs

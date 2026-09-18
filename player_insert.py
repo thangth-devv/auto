@@ -1,6 +1,7 @@
 import re
 import time
 import os
+from collections import Counter
 from datetime import datetime, timedelta
 
 import cv2
@@ -15,6 +16,7 @@ from auto_buy import (
     double_click_input,
     interruptible_sleep,
     key_press,
+    play_notification,
     random_sleep,
     type_text,
 )
@@ -35,8 +37,9 @@ MAX_PRICE_ROIS = (
     (935, 305, 1090, 350),
 )
 # Click the maximum-price row shown below the minimum-price row.
+# The max-price label/value row is above the editable price field.
 MAX_PRICE_X = 1000
-MAX_PRICE_Y = 370
+MAX_PRICE_Y = 332
 ORDER_BUY_X = 826
 ORDER_BUY_Y = 604
 ORDER_CANCEL_X = 968
@@ -44,12 +47,14 @@ ORDER_CANCEL_Y = 604
 # Quantity field in the player purchase dialog shown at 1280x752.
 QUANTITY_X = 995
 QUANTITY_Y = 460
-PLAYER_SELECTION_WAIT = 0.015
+PLAYER_SELECTION_WAIT = 0.25
+POPUP_CLOSE_BEFORE_SELECTION_TIMEOUT = 1.0
 PRICE_DIALOG_TIMEOUT = 0.8
 BUY_POPUP_REGION = (180, 90, 1100, 660)
 MAX_PRICE_INCREASE_RATIO = 1.30
 GIF_CAPTURE_INTERVAL = 0.12
-GIF_RETURN_WAIT = 3.0
+POPUP_CLOSE_TIMEOUT = 10.0
+POPUP_CLOSE_STABLE_READS = 2
 GIF_DIR = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
     "purchase_gifs",
@@ -133,6 +138,72 @@ def _save_price_debug(screen, position, reset_code, stage):
     return marked_path
 
 
+def _save_max_price_click_debug(
+    screen,
+    position,
+    reset_code,
+    attempt,
+    click_x,
+    click_y,
+    expected_price,
+    selected_price,
+):
+    """Save the area around a max-price click for post-run verification."""
+    os.makedirs(OCR_DEBUG_DIR, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    price_label = (
+        "none"
+        if selected_price is None
+        else str(selected_price)
+    )
+    prefix = os.path.join(
+        OCR_DEBUG_DIR,
+        (
+            f"max_price_click_position_{position}_{reset_code}_"
+            f"attempt_{attempt}_expected_{expected_price}_"
+            f"observed_{price_label}_{timestamp}"
+        ),
+    )
+
+    height, width = screen.shape[:2]
+    scale_x = width / REFERENCE_WIDTH
+    scale_y = height / REFERENCE_HEIGHT
+    scaled_x = int(click_x * scale_x)
+    scaled_y = int(click_y * scale_y)
+    crop_half_width = int(150 * scale_x)
+    crop_half_height = int(90 * scale_y)
+    left = max(0, scaled_x - crop_half_width)
+    top = max(0, scaled_y - crop_half_height)
+    right = min(width, scaled_x + crop_half_width)
+    bottom = min(height, scaled_y + crop_half_height)
+    crop = screen[top:bottom, left:right]
+    if crop.size == 0:
+        return None
+
+    marked = crop.copy()
+    relative_x = scaled_x - left
+    relative_y = scaled_y - top
+    cv2.drawMarker(
+        marked,
+        (relative_x, relative_y),
+        (0, 0, 255),
+        cv2.MARKER_CROSS,
+        24,
+        2,
+    )
+    cv2.rectangle(
+        marked,
+        (0, 0),
+        (marked.shape[1] - 1, marked.shape[0] - 1),
+        (0, 255, 255),
+        2,
+    )
+    path = f"{prefix}_click_area.png"
+    if not cv2.imwrite(path, marked):
+        raise OSError(f"Không thể lưu ảnh debug click giá max: {path}")
+    return path
+
+
 def normalize_reset_code(reset_code):
     code = reset_code.strip().lower()
     if re.fullmatch(r"[cl]\d", code):
@@ -183,14 +254,17 @@ def _nearest_reset_datetime(reset_code, now):
         microsecond=0,
     )
 
+    if candidate > now:
+        candidate -= timedelta(hours=1)
+
     for _ in range(48):
         if (
             candidate.hour % 2 == parity
             and candidate <= now
-            and now < candidate + timedelta(minutes=21)
+            and now < candidate + timedelta(minutes=20)
         ):
             return candidate
-        if candidate >= now and candidate.hour % 2 == parity:
+        if candidate > now and candidate.hour % 2 == parity:
             return candidate
         candidate += timedelta(hours=1)
 
@@ -246,30 +320,34 @@ def _read_price(screen):
                 image,
                 config=(
                     "--psm 7 "
-                    "-c tessedit_char_whitelist=0123456789.MB"
+                    "-c tessedit_char_whitelist=0123456789.,MB"
                 ),
                 lang="eng",
             )
-            normalized = text.upper().replace(",", ".").replace(" ", "")
-            unit_match = re.search(r"(\d+(?:\.\d+)?)([MB])", normalized)
+            normalized = text.upper().replace(" ", "")
+            unit_match = re.search(r"(\d+(?:[.,]\d+)?)([MB])", normalized)
             if unit_match:
-                number_text = unit_match.group(1)
+                number_text = unit_match.group(1).replace(",", ".")
                 unit = unit_match.group(2)
-                if "." in number_text and (
-                    len(number_text.split(".", 1)[0]) > 2
-                    or len(number_text.split(".", 1)[1]) != 1
-                ):
-                    continue
+                if "." in number_text:
+                    integer_part, fraction_part = number_text.split(".", 1)
+                    max_fraction_digits = 2 if unit == "B" else 1
+                    if (
+                        len(integer_part) > 2
+                        or len(fraction_part) > max_fraction_digits
+                    ):
+                        continue
                 value = float(number_text)
-                if unit == "M" and "." not in number_text and len(number_text) == 3:
-                    value /= 10
                 multiplier = 1_000_000 if unit == "M" else 1_000_000_000
                 parsed_value = int(value * multiplier)
                 if parsed_value >= 1_000_000:
                     unit_values.append(parsed_value)
 
     if unit_values:
-        return max(unit_values)
+        # Different OCR passes can disagree on a small decimal separator.
+        # Use the value with the strongest OCR consensus, not the largest
+        # numeric result (which would turn 24.2M into 242M).
+        return Counter(unit_values).most_common(1)[0][0]
     return None
 
 
@@ -278,6 +356,40 @@ def _click_purchase_button(hwnd, stop_event, log_callback):
         return False
 
     click_client(hwnd, BUY_PLAYER_X, BUY_PLAYER_Y, fast=True)
+    return True
+
+
+def _click_max_price_row(
+    hwnd,
+    queue_row,
+    position,
+    reset_code,
+    expected_price,
+    stop_event,
+    log_callback,
+):
+    """Click the fixed center of the max-price value after a reset."""
+    if stop_event.is_set():
+        return False
+
+    click_client(hwnd, MAX_PRICE_X, MAX_PRICE_Y, fast=True)
+    random_sleep(0.05, 0.08)
+    clicked_screen = capture_fco(hwnd)
+    debug_path = _save_max_price_click_debug(
+        clicked_screen,
+        position,
+        reset_code,
+        1,
+        MAX_PRICE_X,
+        MAX_PRICE_Y,
+        expected_price,
+        expected_price,
+    )
+    if debug_path:
+        log_callback(
+            f"[Hàng {queue_row}][Vị trí {position}] "
+            f"📸 Đã lưu vùng click giá max: {debug_path}"
+        )
     return True
 
 
@@ -297,19 +409,70 @@ def _buy_popup_visible(screen):
     return bright_ratio >= 0.35
 
 
-def _capture_buy_popup_price(hwnd, stop_event):
+def _capture_buy_popup(hwnd, stop_event):
     deadline = time.time() + PRICE_DIALOG_TIMEOUT
     last_screen = None
     while time.time() < deadline:
         if stop_event.is_set():
-            return None, last_screen
+            return last_screen
         last_screen = capture_fco(hwnd)
         if _buy_popup_visible(last_screen):
-            price = _read_price(last_screen)
-            if price is not None:
-                return price, last_screen
+            return last_screen
         random_sleep(0.005, 0.01)
-    return None, last_screen
+    return None
+
+
+def _capture_buy_popup_price(hwnd, stop_event):
+    screen = _capture_buy_popup(hwnd, stop_event)
+    if screen is None:
+        return None, None
+    price = _read_price(screen)
+    if price is not None:
+        return price, screen
+    return None, screen
+
+
+def _wait_for_buy_popup_close(hwnd, stop_event, gif_frames):
+    """Wait until the purchase popup has closed after submitting the order."""
+    deadline = time.time() + POPUP_CLOSE_TIMEOUT
+    closed_reads = 0
+
+    while time.time() < deadline:
+        if stop_event.is_set():
+            return False
+
+        screen = capture_fco(hwnd)
+        gif_frames.append(
+            Image.fromarray(cv2.cvtColor(screen, cv2.COLOR_BGR2RGB))
+        )
+        if _buy_popup_visible(screen):
+            closed_reads = 0
+        else:
+            closed_reads += 1
+            if closed_reads >= POPUP_CLOSE_STABLE_READS:
+                return True
+        random_sleep(GIF_CAPTURE_INTERVAL, GIF_CAPTURE_INTERVAL)
+
+    return False
+
+
+def _close_popup_before_selection(hwnd, stop_event):
+    """Close a stale purchase popup before clicking a different player row."""
+    key_press(hwnd, win32con.VK_ESCAPE)
+    deadline = time.time() + POPUP_CLOSE_BEFORE_SELECTION_TIMEOUT
+    closed_reads = 0
+    while time.time() < deadline:
+        if stop_event.is_set():
+            return False
+        screen = capture_fco(hwnd)
+        if _buy_popup_visible(screen):
+            closed_reads = 0
+        else:
+            closed_reads += 1
+            if closed_reads >= POPUP_CLOSE_STABLE_READS:
+                return True
+        random_sleep(0.05, 0.08)
+    return False
 
 
 def _select_player_row(hwnd, queue_row, position, stop_event, log_callback):
@@ -355,23 +518,24 @@ def _insert_one(
     if not _click_purchase_button(hwnd, stop_event, log_callback):
         return previous_price, False, False
 
-    price, screen = _capture_buy_popup_price(hwnd, stop_event)
-    if price is None:
+    current_price, screen = _capture_buy_popup_price(hwnd, stop_event)
+    if current_price is None or screen is None:
         log_callback(
             f"[Hàng {queue_row}][Vị trí {position}] "
-            "⚠️ Không đọc được giá."
+            "⚠️ Không đọc được giá trong popup mua."
         )
         key_press(hwnd, win32con.VK_ESCAPE)
         return previous_price, False, False
 
     log_callback(
         f"[Hàng {queue_row}][Vị trí {position}] "
-        f"Giá hiện tại: {_format_price(price)}."
+        f"Giá ghi nhớ: {_format_price(previous_price)}; "
+        f"giá trên game: {_format_price(current_price)}."
     )
-    if previous_price is not None and price == previous_price:
+    if current_price == previous_price:
         log_callback(
-            f"[Hàng {queue_row}][Vị trí {position}] Giá không đổi, đã hủy; "
-            "chuyển sang cầu thủ tiếp theo."
+            f"[Hàng {queue_row}][Vị trí {position}] "
+            "Giá không đổi, đã hủy; chuyển sang lần kiểm tra tiếp theo."
         )
         key_press(hwnd, win32con.VK_ESCAPE)
         return previous_price, False, False
@@ -380,12 +544,29 @@ def _insert_one(
         Image.fromarray(cv2.cvtColor(screen, cv2.COLOR_BGR2RGB))
     ]
     _add_gif_frame(gif_frames, hwnd)
-    click_client(hwnd, MAX_PRICE_X, MAX_PRICE_Y, fast=True)
+
+    if not _click_max_price_row(
+        hwnd,
+        queue_row,
+        position,
+        reset_code,
+        previous_price,
+        stop_event,
+        log_callback,
+    ):
+        log_callback(
+            f"[Hàng {queue_row}][Vị trí {position}] "
+            "❌ Không xác thực được hàng giá max hợp lệ, hủy lệnh mua."
+        )
+        key_press(hwnd, win32con.VK_ESCAPE)
+        return previous_price, False, False
+
     _add_gif_frame(gif_frames, hwnd)
+
     if quantity > 1:
         log_callback(
             f"[Hàng {queue_row}][Vị trí {position}] "
-            f"Giá đã thay đổi, nhập số lượng {quantity}."
+            f"Nhập số lượng theo tool: {quantity}."
         )
         double_click_input(hwnd, QUANTITY_X, QUANTITY_Y)
         random_sleep(0.03, 0.05)
@@ -394,31 +575,21 @@ def _insert_one(
     random_sleep(0.02, 0.04)
     click_client(hwnd, ORDER_BUY_X, ORDER_BUY_Y, fast=True)
     _add_gif_frame(gif_frames, hwnd)
+
+    popup_closed = _wait_for_buy_popup_close(hwnd, stop_event, gif_frames)
+    if not popup_closed:
+        log_callback(
+            f"[Hàng {queue_row}][Vị trí {position}] "
+            "⚠️ Chưa xác nhận popup mua đã đóng; chưa phát thông báo."
+        )
+        return previous_price, False, False
+
     log_callback(
         f"[Hàng {queue_row}][Vị trí {position}] ✅ Đã gửi lệnh mua "
         f"{quantity} cầu thủ; "
-        f"giá trước khi mua: {_format_price(price)}."
+        f"mua được với giá {_format_price(current_price)}/cầu thủ "
+        f"(giá ghi nhớ: {_format_price(previous_price)})."
     )
-
-    deadline = time.time() + GIF_RETURN_WAIT
-    while time.time() < deadline:
-        if stop_event.is_set():
-            break
-        random_sleep(GIF_CAPTURE_INTERVAL, GIF_CAPTURE_INTERVAL)
-        _add_gif_frame(gif_frames, hwnd)
-
-    price_after_purchase = _read_price(capture_fco(hwnd))
-    if price_after_purchase is None:
-        log_callback(
-            f"[Hàng {queue_row}][Vị trí {position}] "
-            "⚠️ Không đọc được giá sau khi mua "
-            f"(giá trước khi mua: {_format_price(price)})."
-        )
-    else:
-        log_callback(
-            f"[Hàng {queue_row}][Vị trí {position}] Giá sau khi mua: "
-            f"{_format_price(price_after_purchase)}."
-        )
 
     gif_path = _save_purchase_gif(gif_frames, position, reset_code)
     if gif_path:
@@ -426,13 +597,14 @@ def _insert_one(
             f"[Hàng {queue_row}][Vị trí {position}] 🎞️ Đã lưu GIF: {gif_path}"
         )
 
-    return price, True, False
+    return previous_price, True, False
 
 
 def _check_initial_price(
     hwnd,
     queue_row,
     position,
+    reset_code,
     stop_event,
     log_callback,
     already_selected=False,
@@ -450,9 +622,22 @@ def _check_initial_price(
     key_press(hwnd, win32con.VK_ESCAPE)
 
     if price is None:
+        debug_path = None
+        if screen is not None:
+            debug_path = _save_price_debug(
+                screen,
+                position,
+                reset_code,
+                "initial_price_unreadable",
+            )
         log_callback(
             f"[Hàng {queue_row}][Vị trí {position}] "
             "⚠️ Không đọc được giá max ban đầu."
+            + (
+                f" Ảnh debug: {debug_path}"
+                if debug_path
+                else " Không có ảnh màn hình cuối để debug."
+            )
         )
         return None
 
@@ -489,6 +674,14 @@ def run_player_insert(hwnd, entries, stop_event, log_callback):
         position = entry["position"]
         reset_code = entry["reset"]
         quantity = entry["quantity"]
+        # A popup left open from the previous game selection would intercept
+        # the row click and make the next price read use the wrong player.
+        if not _close_popup_before_selection(hwnd, stop_event):
+            log_callback(
+                f"[Hàng {queue_row}][Vị trí {position}] "
+                "⚠️ Không đóng được popup cũ trước khi chọn cầu thủ."
+            )
+            break
         if not _select_player_row(
             hwnd,
             queue_row,
@@ -502,57 +695,41 @@ def run_player_insert(hwnd, entries, stop_event, log_callback):
         prepared_reset = None
         reset_started = None
         waiting_reset_logged = None
-        selected_price = _check_initial_price(
-            hwnd,
-            queue_row,
-            position,
-            stop_event,
-            log_callback,
-            already_selected=True,
-        )
-        if selected_price is None:
-            log_callback(
-                f"[Thứ tự {queue_row}][Vị trí {position}] "
-                "Không có giá mốc, bỏ qua cầu thủ này."
-            )
-            continue
+        selected_price = None
 
         while not stop_event.is_set():
             now = datetime.now()
             reset_at = _nearest_reset_datetime(reset_code, now)
             seconds_to_reset = (reset_at - now).total_seconds()
 
-            if (
-                seconds_to_reset > 0
-                and seconds_to_reset <= 60
-                and prepared_reset != reset_at
-            ):
-                log_callback(
-                    f"[Thứ tự {queue_row}][Vị trí {position}] "
-                    "Còn 1 phút đến reset, cập nhật lại giá."
-                )
-                if _select_player_row(
-                    hwnd, queue_row, position, stop_event, log_callback
-                ):
+            in_window = reset_at <= now < reset_at + timedelta(minutes=20)
+            if in_window:
+                if prepared_reset != reset_at:
+                    log_callback(
+                        f"[Thứ tự {queue_row}][Vị trí {position}] "
+                        f"Reset {reset_code}: cập nhật giá ghi nhớ."
+                    )
+                    if not _select_player_row(
+                        hwnd, queue_row, position, stop_event, log_callback
+                    ):
+                        break
                     selected_price = _check_initial_price(
                         hwnd,
                         queue_row,
                         position,
+                        reset_code,
                         stop_event,
                         log_callback,
                         already_selected=True,
                     )
                     prepared_reset = reset_at
+                    if selected_price is None:
+                        log_callback(
+                            f"[Thứ tự {queue_row}][Vị trí {position}] "
+                            "Không cập nhật được giá reset; bỏ qua reset này."
+                        )
+                        break
 
-            matches, reset_minute = _reset_matches_hour(
-                reset_code,
-                now.hour,
-            )
-            in_window = (
-                matches
-                and reset_minute <= now.minute < reset_minute + 20
-            )
-            if in_window:
                 if reset_started != reset_at:
                     reset_started = reset_at
                     log_callback(
@@ -565,7 +742,7 @@ def run_player_insert(hwnd, entries, stop_event, log_callback):
                         "Hết 20 phút không đổi; chuyển sang thứ tự kế tiếp."
                     )
                     break
-                if now.second >= 12:
+                if now.second >= 15:
                     interruptible_sleep(0.2)
                     continue
                 (
@@ -583,6 +760,11 @@ def run_player_insert(hwnd, entries, stop_event, log_callback):
                     log_callback,
                 )
                 if purchased:
+                    log_callback(
+                        f"[Thứ tự {queue_row}][Vị trí {position}] "
+                        "✅ Chèn cầu thủ thành công, phát âm thanh thông báo."
+                    )
+                    play_notification(log_callback)
                     break
                 if exhausted:
                     break
