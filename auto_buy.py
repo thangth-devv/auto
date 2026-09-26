@@ -1,6 +1,9 @@
 import time
 import random
 import re
+import os
+import ctypes
+import sys
 import cv2
 import numpy as np
 from PIL import ImageGrab
@@ -12,6 +15,21 @@ import win32api
 _active_stop_event = None
 
 
+def resource_path(relative_path):
+    """
+    Resolve bundled resources for normal Python and PyInstaller builds.
+    """
+    if getattr(sys, "frozen", False):
+        base_path = getattr(
+            sys,
+            "_MEIPASS",
+            os.path.dirname(sys.executable),
+        )
+    else:
+        base_path = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base_path, relative_path)
+
+
 try:
     import pytesseract
 except ImportError as exc:
@@ -19,7 +37,9 @@ except ImportError as exc:
         "Thiếu pytesseract. Chạy: python -m pip install pytesseract"
     ) from exc
 
-TESSERACT_PATH = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+TESSERACT_PATH = resource_path(
+    os.path.join("tesseract", "tesseract.exe")
+)
 pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH
 
 
@@ -51,38 +71,6 @@ def random_sleep(min_seconds, max_seconds):
 # ============================================================
 # TEMPLATE PATH
 # ============================================================
-
-import os
-import ctypes
-import sys
-
-
-def resource_path(relative_path):
-    """
-    Lấy đường dẫn resource khi chạy:
-    - Python bình thường
-    - PyInstaller --onedir
-    - PyInstaller --onefile
-    """
-
-    if getattr(sys, "frozen", False):
-        # PyInstaller
-        base_path = getattr(
-            sys,
-            "_MEIPASS",
-            os.path.dirname(sys.executable)
-        )
-    else:
-        # Chạy bằng Python
-        base_path = os.path.dirname(
-            os.path.abspath(__file__)
-        )
-
-    return os.path.join(
-        base_path,
-        relative_path
-    )
-
 
 TEMPLATE_DIR = resource_path("templates")
 
@@ -311,11 +299,18 @@ def log_message(
 # CLICK CLIENT
 # ============================================================
 
+def activate_window(hwnd):
+    """Focus the game for keyboard input without moving the mouse."""
+    if win32gui.IsIconic(hwnd):
+        win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+    win32gui.SetForegroundWindow(hwnd)
+
+
 def click_client(
     hwnd,
     image_x,
     image_y,
-    method="send",
+    method="message",
     fast=False,
 ):
     client_x, client_y = image_to_client(
@@ -324,46 +319,97 @@ def click_client(
         image_y
     )
 
-    lparam = win32api.MAKELONG(
-        int(client_x),
-        int(client_y)
-    )
-
     print(
         f"    Click image=({image_x},{image_y}) "
         f"client=({client_x},{client_y})"
     )
 
-    message = (
-        win32gui.SendMessage
-        if method == "send"
-        else win32gui.PostMessage
+    # All click modes intentionally use window messages. Never move or press
+    # the user's real mouse, including for legacy callers passing "send".
+    lparam = win32api.MAKELONG(
+        int(client_x),
+        int(client_y),
     )
-
-    message(
-        hwnd,
-        win32con.WM_MOUSEMOVE,
-        0,
-        lparam
-    )
-    if not fast:
-        random_sleep(0.025, 0.035)
-    message(
+    win32gui.SendMessage(hwnd, win32con.WM_MOUSEMOVE, 0, lparam)
+    win32gui.SendMessage(
         hwnd,
         win32con.WM_LBUTTONDOWN,
         win32con.MK_LBUTTON,
-        lparam
+        lparam,
     )
-    if not fast:
-        random_sleep(0.025, 0.035)
-    message(
+    win32gui.SendMessage(hwnd, win32con.WM_LBUTTONUP, 0, lparam)
+
+
+def scroll_client(hwnd, image_x, image_y, notches=-5):
+    """Scroll the game list without moving or capturing the real cursor."""
+    left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+    window_width = right - left
+    window_height = bottom - top
+    scale_x = window_width / REFERENCE_WIDTH
+    scale_y = window_height / REFERENCE_HEIGHT
+    screen_x = left + int(image_x * scale_x)
+    screen_y = top + int(image_y * scale_y)
+
+    # WM_MOUSEWHEEL expects the pointer position in screen coordinates, so
+    # the target child can handle the event as if the cursor were over the
+    # list without moving the user's actual cursor.
+    target_hwnd = win32gui.WindowFromPoint((screen_x, screen_y))
+    if not target_hwnd or (
+        target_hwnd != hwnd and not win32gui.IsChild(hwnd, target_hwnd)
+    ):
+        target_hwnd = hwnd
+
+    wheel_position = win32api.MAKELONG(screen_x, screen_y)
+    direction = 1 if notches > 0 else -1
+    for _ in range(abs(notches)):
+        wheel_delta = direction * 120
+        wheel_wparam = win32api.MAKELONG(
+            0,
+            wheel_delta & 0xFFFF,
+        )
+        win32gui.PostMessage(
+            target_hwnd,
+            win32con.WM_MOUSEWHEEL,
+            wheel_wparam,
+            wheel_position,
+        )
+        time.sleep(0.08)
+
+
+def drag_client(hwnd, start_x, start_y, end_x, end_y):
+    """Drag a game scrollbar using only window messages."""
+    drag_client_message(hwnd, start_x, start_y, end_x, end_y)
+
+
+def drag_client_message(hwnd, start_x, start_y, end_x, end_y):
+    """Legacy message-based drag helper."""
+    start_client_x, start_client_y = image_to_client(
         hwnd,
-        win32con.WM_LBUTTONUP,
-        0,
-        lparam
+        start_x,
+        start_y,
     )
-    if not fast:
-        random_sleep(0.045, 0.065)
+    end_client_x, end_client_y = image_to_client(
+        hwnd,
+        end_x,
+        end_y,
+    )
+    start_lparam = win32api.MAKELONG(
+        int(start_client_x),
+        int(start_client_y),
+    )
+    end_lparam = win32api.MAKELONG(
+        int(end_client_x),
+        int(end_client_y),
+    )
+    win32gui.SendMessage(hwnd, win32con.WM_MOUSEMOVE, 0, start_lparam)
+    win32gui.SendMessage(
+        hwnd,
+        win32con.WM_LBUTTONDOWN,
+        win32con.MK_LBUTTON,
+        start_lparam,
+    )
+    win32gui.SendMessage(hwnd, win32con.WM_MOUSEMOVE, win32con.MK_LBUTTON, end_lparam)
+    win32gui.SendMessage(hwnd, win32con.WM_LBUTTONUP, 0, end_lparam)
 
 
 # ============================================================
@@ -416,36 +462,19 @@ def key_press(hwnd, vk, char=None):
         key_up=True
     )
 
-    win32gui.SendMessage(
-        hwnd,
-        win32con.WM_KEYDOWN,
+    activate_window(hwnd)
+    win32api.keybd_event(
         vk,
-        down_lparam
+        win32api.MapVirtualKey(vk, 0),
+        0,
+        0,
     )
-
-    random_sleep(
-        0.03,
-        0.05
-    )
-
-    if char is not None:
-        win32gui.SendMessage(
-            hwnd,
-            win32con.WM_CHAR,
-            ord(char),
-            0
-        )
-
-    random_sleep(
-        0.02,
-        0.04
-    )
-
-    win32gui.SendMessage(
-        hwnd,
-        win32con.WM_KEYUP,
+    random_sleep(0.03, 0.05)
+    win32api.keybd_event(
         vk,
-        up_lparam
+        win32api.MapVirtualKey(vk, 0),
+        win32con.KEYEVENTF_KEYUP,
+        0,
     )
 
 
@@ -461,26 +490,32 @@ def key_release(hwnd, vk):
 
 def select_all_input(hwnd):
     """Chọn toàn bộ nội dung của ô đang được focus."""
-    win32gui.SendMessage(
-        hwnd,
-        win32con.WM_KEYDOWN,
+    activate_window(hwnd)
+    win32api.keybd_event(
         win32con.VK_CONTROL,
-        _key_lparam(win32con.VK_CONTROL)
+        win32api.MapVirtualKey(win32con.VK_CONTROL, 0),
+        0,
+        0,
     )
     random_sleep(0.03, 0.05)
-    win32gui.SendMessage(
-        hwnd,
-        win32con.WM_KEYDOWN,
+    win32api.keybd_event(
         ord("A"),
-        _key_lparam(ord("A"))
+        win32api.MapVirtualKey(ord("A"), 0),
+        0,
+        0,
     )
-    win32gui.SendMessage(
-        hwnd,
-        win32con.WM_KEYUP,
+    win32api.keybd_event(
         ord("A"),
-        _key_lparam(ord("A"), key_up=True)
+        win32api.MapVirtualKey(ord("A"), 0),
+        win32con.KEYEVENTF_KEYUP,
+        0,
     )
-    key_release(hwnd, win32con.VK_CONTROL)
+    win32api.keybd_event(
+        win32con.VK_CONTROL,
+        win32api.MapVirtualKey(win32con.VK_CONTROL, 0),
+        win32con.KEYEVENTF_KEYUP,
+        0,
+    )
 
 
 def clear_input(hwnd):
@@ -549,61 +584,28 @@ def image_to_client(hwnd, image_x, image_y):
     )
 
 
-def double_click_input(hwnd, image_x, image_y):
+def double_click_input(hwnd, image_x, image_y, method="message"):
     """
-    Double-click vào ô nhập bằng SendMessage.
-    Gửi double-click nền vào ô nhập, không di chuyển chuột thật.
+    Double-click vào ô nhập bằng message hoặc input thật.
     """
-    client_x, client_y = image_to_client(
-        hwnd,
-        image_x,
-        image_y
-    )
-
-    lparam = win32api.MAKELONG(
-        int(client_x),
-        int(client_y)
-    )
-
-    win32gui.SendMessage(
-        hwnd,
-        win32con.WM_MOUSEMOVE,
-        0,
-        lparam
-    )
-    random_sleep(0.05, 0.08)
+    client_x, client_y = image_to_client(hwnd, image_x, image_y)
+    lparam = win32api.MAKELONG(int(client_x), int(client_y))
+    win32gui.SendMessage(hwnd, win32con.WM_MOUSEMOVE, 0, lparam)
     win32gui.SendMessage(
         hwnd,
         win32con.WM_LBUTTONDOWN,
         win32con.MK_LBUTTON,
-        lparam
+        lparam,
     )
-    win32gui.SendMessage(
-        hwnd,
-        win32con.WM_LBUTTONUP,
-        0,
-        lparam
-    )
-    random_sleep(0.05, 0.08)
-    win32gui.SendMessage(
-        hwnd,
-        win32con.WM_LBUTTONDOWN,
-        win32con.MK_LBUTTON,
-        lparam
-    )
+    win32gui.SendMessage(hwnd, win32con.WM_LBUTTONUP, 0, lparam)
+    time.sleep(0.06)
     win32gui.SendMessage(
         hwnd,
         win32con.WM_LBUTTONDBLCLK,
         win32con.MK_LBUTTON,
-        lparam
+        lparam,
     )
-    random_sleep(0.05, 0.08)
-    win32gui.SendMessage(
-        hwnd,
-        win32con.WM_LBUTTONUP,
-        0,
-        lparam
-    )
+    win32gui.SendMessage(hwnd, win32con.WM_LBUTTONUP, 0, lparam)
 
 
 def set_filter_by_double_click(
@@ -613,7 +615,8 @@ def set_filter_by_double_click(
     value,
     label,
     log_callback=None,
-    clear_before_input=False
+    clear_before_input=False,
+    mouse_method="message",
 ):
     """
     Click đúp vào ô -> nhập giá trị -> Enter.
@@ -627,7 +630,8 @@ def set_filter_by_double_click(
     double_click_input(
         hwnd,
         image_x,
-        image_y
+        image_y,
+        method=mouse_method,
     )
 
     random_sleep(
@@ -769,7 +773,8 @@ def set_filter_with_verification(
     max_attempts=3,
     verification_value=None,
     verification_roi_half_width=42,
-    clear_before_input=False
+    clear_before_input=False,
+    mouse_method="message",
 ):
     """Nhập một ô lọc và xác minh lại giá trị bằng OCR."""
     expected_value = (
@@ -790,7 +795,8 @@ def set_filter_with_verification(
             value,
             label,
             log_callback,
-            clear_before_input=clear_before_input
+            clear_before_input=clear_before_input,
+            mouse_method=mouse_method,
         )
 
         actual = read_filter_value(
@@ -853,7 +859,8 @@ def set_purchase_filters(
     stat_max,
     max_card_price,
     quantity,
-    log_callback=None
+    log_callback=None,
+    mouse_method="message",
 ):
     """
     Flow:
@@ -930,10 +937,12 @@ def set_purchase_filters(
             value,
             label,
             log_callback,
-            clear_before_input=True
+            clear_before_input=True,
+            mouse_method=mouse_method,
         )
 
-    # 3. Giá tối đa mỗi thẻ
+    # 3. Giá tối đa mỗi thẻ. The configured value is entered directly into
+    # the game's price field without an additional unit conversion.
     set_filter_with_verification(
         hwnd,
         MAX_CARD_PRICE_X,
@@ -942,7 +951,8 @@ def set_purchase_filters(
         "Giá tối đa mỗi thẻ",
         log_callback,
         verification_value=max_card_price * 10000,
-        verification_roi_half_width=140
+        verification_roi_half_width=140,
+        mouse_method=mouse_method,
     )
 
     # 4. Số lượng mỗi lần mua - KHÔNG nằm trong profile.
@@ -952,7 +962,8 @@ def set_purchase_filters(
         QUANTITY_Y,
         quantity,
         "Số lượng",
-        log_callback
+        log_callback,
+        mouse_method=mouse_method,
     )
 
     log_message(
@@ -973,7 +984,8 @@ def click_failure_confirm(
     confirm_template_bold,
     threshold,
     stop_event=None,
-    log_callback=None
+    log_callback=None,
+    mouse_method="message",
 ):
     """
     Xử lý nút 'Xác nhận' trên popup Mua thất bại.
@@ -1044,7 +1056,7 @@ def click_failure_confirm(
                     hwnd,
                     best_x,
                     best_y,
-                    method="send"
+                    method=mouse_method,
                 )
 
                 return True
@@ -1094,7 +1106,7 @@ def click_failure_confirm(
                     hwnd,
                     x,
                     y,
-                    method="send"
+                    method=mouse_method,
                 )
 
                 random_sleep(
@@ -1335,7 +1347,7 @@ def click_until_disappear(
     template,
     x,
     y,
-    method="send",
+    method="message",
     threshold=0.8,
     max_attempts=2,
     wait_after_click=0.2,
@@ -1343,10 +1355,9 @@ def click_until_disappear(
     log_callback=None
 ):
 
-    for attempt in range(
-        1,
-        max_attempts + 1
-    ):
+    attempt = 0
+    while max_attempts is None or attempt < max_attempts:
+        attempt += 1
 
         # ----------------------------------------------------
         # STOP
@@ -1361,7 +1372,10 @@ def click_until_disappear(
 
 
         log_message(
-            f"    Click lần {attempt}/{max_attempts}",
+            (
+                f"    Click lần {attempt}/"
+                f"{max_attempts if max_attempts is not None else 'không giới hạn'}"
+            ),
             log_callback
         )
 
@@ -1693,7 +1707,9 @@ def run_auto_buy(
     quantity,
     stop_event=None,
     log_callback=None,
-    player_count_callback=None
+    player_count_callback=None,
+    notify_on_complete=True,
+    mouse_method="message",
 ):
     global _active_stop_event
 
@@ -1804,7 +1820,8 @@ def run_auto_buy(
             stat_max,
             max_card_price,
             quantity,
-            log_callback=log_callback
+            log_callback=log_callback,
+            mouse_method=mouse_method,
         )
     except Exception as exc:
         log_message(
@@ -1960,7 +1977,7 @@ def run_auto_buy(
             hwnd,
             result["x"],
             result["y"],
-            method="send"
+            method=mouse_method,
         )
 
 
@@ -2056,7 +2073,7 @@ def run_auto_buy(
             hwnd,
             result["x"],
             result["y"],
-            method="send"
+            method=mouse_method,
         )
 
 
@@ -2252,7 +2269,8 @@ def run_auto_buy(
                 confirm_bulk_bold,
                 threshold,
                 stop_event=stop_event,
-                log_callback=log_callback
+                log_callback=log_callback,
+                mouse_method=mouse_method,
             )
 
             if not confirmed:
@@ -2351,7 +2369,7 @@ def run_auto_buy(
                 receive_now,
                 result["x"],
                 result["y"],
-                method="send",
+                method=mouse_method,
                 threshold=threshold,
                 max_attempts=2,
                 wait_after_click=0.2,
@@ -2486,9 +2504,9 @@ def run_auto_buy(
                 confirm_received,
                 final_confirm_result["x"],
                 final_confirm_result["y"],
-                method="post",
+                method=mouse_method,
                 threshold=threshold,
-                max_attempts=2,
+                max_attempts=None,
                 wait_after_click=0.25,
                 stop_event=stop_event,
                 log_callback=log_callback
@@ -2549,7 +2567,8 @@ def run_auto_buy(
                     log_callback
                 )
 
-                play_notification(log_callback)
+                if notify_on_complete:
+                    play_notification(log_callback)
 
                 break
 

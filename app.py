@@ -8,10 +8,24 @@ import sys
 import time
 import json
 import re
+import unicodedata
+import hashlib
+from collections import Counter
+from tkinter import messagebox
 
+import cv2
+import numpy as np
+import pytesseract
 from PIL import Image, ImageTk
 
-from auto_buy import run_auto_buy
+from auto_buy import (
+    capture_fco,
+    click_client,
+    key_press,
+    play_notification,
+    run_auto_buy,
+    scroll_client,
+)
 from player_insert import normalize_reset_code, run_player_insert, sort_entries_by_reset
 
 
@@ -39,6 +53,41 @@ TEXT = "#F3F6F8"
 MUTED = "#7F8C97"
 DANGER = "#D85E5E"
 WARNING = "#E6C04E"
+UPGRADE_TITLE_ROI = (975, 58, 1135, 108)
+OWNED_PLAYERS_TAB_ROI = (595, 108, 765, 166)
+OVR_SORT_POSITION = (890, 230)
+OVR_ARROW_ROI = (890, 218, 908, 242)
+OVR_SORT_MAX_CLICKS = 3
+# Keep the level region limited to the card badge so nearby columns cannot
+# contaminate template matching.
+PLAYER_OVR_ROI = (858, 246, 902, 281)
+PLAYER_CARD_LEVEL_ROI = (904, 246, 950, 281)
+PLAYER_ROW_FIRST_Y = 263
+PLAYER_ROW_STEP_Y = 40
+PLAYER_ROW_COUNT = 10
+PLAYER_ROW_CLICK_X = 760
+UPGRADE_NEXT_POSITION = (1025, 668)
+UPGRADE_CONFIRM_POSITION = (1015, 575)
+UPGRADE_CONFIRM_ROI = (940, 555, 1095, 595)
+SKIP_PROMPT_ROI = (1035, 695, 1215, 745)
+BUY_BULK_TAB_POSITION = (900, 140)
+OWNED_PLAYERS_TAB_POSITION = (680, 140)
+# Keep enough margin for the card-level templates (25x18 at reference scale).
+OWNED_CARD_LEVEL_ROI = (530, 176, 565, 216)
+# The result-screen "Tiếp" button is the wide green control at the lower
+# right. Keep this ROI tight so green navigation/status elements cannot
+# satisfy the detector before the result screen is ready.
+# The result-screen "Tiếp" button is near the lower-right corner. Keep this
+# ROI tight enough to exclude the other controls shown during the animation.
+RESULT_NEXT_ROI = (980, 688, 1150, 738)
+PLAYER_LIST_MAX_SCROLLS = 12
+PLAYER_LIST_SCROLL_POSITION = (1040, 500)
+PLAYER_LIST_SCROLL_NOTCHES = -10
+PURCHASED_PLAYERS_SCROLL_NOTCHES = 10
+PLAYER_LIST_ROI = (595, 240, 1120, 660)
+PLAYER_ID_ROI = (635, 250, 860, 276)
+UPGRADE_RATE_ROI = (300, 512, 565, 542)
+MAX_UPGRADE_PLAYERS = 5
 
 
 # ============================================================
@@ -54,6 +103,13 @@ player_insert_window = None
 player_insert_thread = None
 player_insert_stop_event = None
 player_insert_layout = None
+upgrade_window = None
+upgrade_layout = None
+upgrade_stop_event = None
+
+
+def _upgrade_stop_requested():
+    return upgrade_stop_event is not None and upgrade_stop_event.is_set()
 
 
 # ============================================================
@@ -1230,11 +1286,1899 @@ sidebar_item(
     command=lambda: show_auto_buy()
 )
 
+def _hide_main_content():
+    layout = []
+    for widget in main.winfo_children():
+        if widget is topbar:
+            continue
+        layout.append((widget, widget.pack_info()))
+        widget.pack_forget()
+    return layout
+
+
+def _restore_main_content(layout):
+    if layout is None:
+        return
+    for widget, widget_layout in layout:
+        widget.pack(**widget_layout)
+
+
+def _upgrade_screen_detected(hwnd):
+    screen = capture_fco(hwnd)
+    if not _owned_players_tab_selected(screen):
+        return False
+
+    height, width = screen.shape[:2]
+    roi_left, roi_top, roi_right, roi_bottom = UPGRADE_TITLE_ROI
+    scale_x = width / 1280
+    scale_y = height / 752
+    title_region = screen[
+        int(roi_top * scale_y):int(roi_bottom * scale_y),
+        int(roi_left * scale_x):int(roi_right * scale_x),
+    ]
+    if title_region.size == 0:
+        return False
+
+    gray = cv2.cvtColor(title_region, cv2.COLOR_BGR2GRAY)
+    enlarged = cv2.resize(
+        gray,
+        None,
+        fx=4,
+        fy=4,
+        interpolation=cv2.INTER_CUBIC,
+    )
+    variants = (
+        enlarged,
+        cv2.threshold(
+            enlarged,
+            0,
+            255,
+            cv2.THRESH_BINARY + cv2.THRESH_OTSU,
+        )[1],
+        cv2.threshold(
+            enlarged,
+            150,
+            255,
+            cv2.THRESH_BINARY,
+        )[1],
+    )
+    for variant in variants:
+        text = pytesseract.image_to_string(
+            variant,
+            config="--psm 7",
+            lang="eng",
+        ).lower()
+        normalized = text.translate(str.maketrans({"đ": "d", "Đ": "D"}))
+        normalized = unicodedata.normalize("NFKD", normalized)
+        normalized = "".join(
+            character
+            for character in normalized
+            if not unicodedata.combining(character)
+        )
+        normalized = re.sub(r"[^a-z0-9]+", " ", normalized)
+        if "nang cap cau thu" in normalized or "nang cap" in normalized:
+            return True
+
+    # The title is grey on a dark background and can be missed by OCR.
+    title_gray = cv2.cvtColor(title_region, cv2.COLOR_BGR2GRAY)
+    title_text_band = title_gray[
+        int(title_gray.shape[0] * 0.25):int(title_gray.shape[0] * 0.85),
+        int(title_gray.shape[1] * 0.05):int(title_gray.shape[1] * 0.95),
+    ]
+    return float((title_text_band >= 95).mean()) >= 0.025
+
+
+def _owned_players_tab_selected(screen):
+    height, width = screen.shape[:2]
+    roi_left, roi_top, roi_right, roi_bottom = OWNED_PLAYERS_TAB_ROI
+    scale_x = width / 1280
+    scale_y = height / 752
+    tab_region = screen[
+        int(roi_top * scale_y):int(roi_bottom * scale_y),
+        int(roi_left * scale_x):int(roi_right * scale_x),
+    ]
+    if tab_region.size == 0:
+        return False
+
+    gray = cv2.cvtColor(tab_region, cv2.COLOR_BGR2GRAY)
+    enlarged = cv2.resize(
+        gray,
+        None,
+        fx=4,
+        fy=4,
+        interpolation=cv2.INTER_CUBIC,
+    )
+    text = pytesseract.image_to_string(
+        enlarged,
+        config="--psm 7",
+        lang="eng",
+    ).lower()
+    normalized = text.translate(str.maketrans({"đ": "d", "Đ": "D"}))
+    normalized = unicodedata.normalize("NFKD", normalized)
+    normalized = "".join(
+        character
+        for character in normalized
+        if not unicodedata.combining(character)
+    )
+    normalized = re.sub(r"[^a-z0-9]+", " ", normalized)
+    has_owned_players_text = (
+        "cau thu" in normalized
+        and ("dang so huu" in normalized or "so huu" in normalized)
+    )
+
+    # The selected tab has a bright horizontal underline at the bottom.
+    underline = gray[int(gray.shape[0] * 0.72):, :]
+    bright_ratio = float((underline >= 130).mean())
+    selected = bright_ratio >= 0.035
+    return selected
+
+
+def _ovr_sorted_ascending(screen, log_callback=None):
+    height, width = screen.shape[:2]
+    left, top, right, bottom = OVR_ARROW_ROI
+    scale_x = width / 1280
+    scale_y = height / 752
+    arrow_region = screen[
+        int(top * scale_y):int(bottom * scale_y),
+        int(left * scale_x):int(right * scale_x),
+    ]
+    if arrow_region.size == 0:
+        return False
+
+    gray = cv2.cvtColor(arrow_region, cv2.COLOR_BGR2GRAY)
+    bright = cv2.threshold(gray, 115, 255, cv2.THRESH_BINARY)[1]
+    bright = cv2.morphologyEx(
+        bright,
+        cv2.MORPH_OPEN,
+        np.ones((2, 2), dtype=np.uint8),
+    )
+    row_counts = (bright > 0).sum(axis=1)
+    total_bright = int(row_counts.sum())
+    if total_bright < 8:
+        if log_callback is not None:
+            log_callback(f"🔬 OVR icon: quá ít điểm sáng ({total_bright}).")
+        return False
+
+    peak_row = int(row_counts.argmax())
+    if peak_row < 3 or peak_row >= len(row_counts) - 3:
+        if log_callback is not None:
+            log_callback(f"🔬 OVR icon: không có đỉnh hợp lệ ({peak_row}).")
+        return False
+
+    upper_pixels = int(row_counts[:peak_row].sum())
+    lower_pixels = int(row_counts[peak_row + 1:].sum())
+    upper_peak = int(row_counts[:peak_row].max())
+    lower_peak = int(row_counts[peak_row + 1:].max())
+    detected = (
+        upper_peak >= 2
+        and lower_peak >= 1
+        and upper_pixels >= 3
+        and lower_pixels >= 2
+        and row_counts[peak_row] >= upper_peak
+        and row_counts[peak_row] >= lower_peak
+        and total_bright <= 150
+    )
+    if log_callback is not None:
+        log_callback(
+            "🔬 OVR icon metrics: "
+            f"upper={upper_pixels}, peak={int(row_counts[peak_row])}, "
+            f"lower={lower_pixels}, total={total_bright}, "
+            f"detected={detected}."
+        )
+    return detected
+
+
+def _sort_ovr_ascending(hwnd, log_upgrade):
+    for attempt in range(OVR_SORT_MAX_CLICKS + 1):
+        log_upgrade(
+            f"🔎 Đang kiểm tra icon OVR (lần {attempt + 1}/{OVR_SORT_MAX_CLICKS + 1})..."
+        )
+        screen = capture_fco(hwnd)
+        detected = _ovr_sorted_ascending(screen, log_upgrade)
+        if detected:
+            log_upgrade("✅ Cột OVR đã ở trạng thái tăng dần.")
+            return True
+
+        if attempt == OVR_SORT_MAX_CLICKS:
+            break
+
+        log_upgrade(
+            f"🖱️ Click OVR tại {OVR_SORT_POSITION[0]}, {OVR_SORT_POSITION[1]}."
+        )
+        _upgrade_click(
+            hwnd,
+            OVR_SORT_POSITION[0],
+            OVR_SORT_POSITION[1],
+        )
+        log_upgrade(
+            f"↕️ Đã click cột OVR lần {attempt + 1}; đang kiểm tra icon..."
+        )
+        time.sleep(1.0)
+
+    return False
+
+
+def _upgrade_click(hwnd, image_x, image_y):
+    """Send upgrade clicks to the game without moving the user's cursor."""
+    click_client(
+        hwnd,
+        image_x,
+        image_y,
+        method="message",
+        fast=True,
+    )
+
+
+def _read_player_ovr(screen, row_y):
+    height, width = screen.shape[:2]
+    left, top, right, bottom = PLAYER_OVR_ROI
+    scale_x = width / 1280
+    scale_y = height / 752
+    row_half_height = (bottom - top) / 2
+    roi = screen[
+        int((row_y - row_half_height) * scale_y):
+        int((row_y + row_half_height) * scale_y),
+        int(left * scale_x):int(right * scale_x),
+    ]
+    if roi.size == 0:
+        return None
+
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    enlarged = cv2.resize(
+        gray,
+        None,
+        fx=6,
+        fy=6,
+        interpolation=cv2.INTER_CUBIC,
+    )
+    padded = cv2.copyMakeBorder(
+        enlarged,
+        18,
+        18,
+        18,
+        18,
+        cv2.BORDER_CONSTANT,
+        value=0,
+    )
+    variants = (
+        padded,
+        cv2.threshold(
+            padded,
+            0,
+            255,
+            cv2.THRESH_BINARY + cv2.THRESH_OTSU,
+        )[1],
+        cv2.threshold(
+            padded,
+            0,
+            255,
+            cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU,
+        )[1],
+        cv2.adaptiveThreshold(
+            padded,
+            255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY,
+            31,
+            5,
+        ),
+    )
+    for variant in variants:
+        for psm in (7, 8, 13):
+            text = pytesseract.image_to_string(
+                variant,
+                config=(
+                    f"--psm {psm} "
+                    "-c tessedit_char_whitelist=0123456789"
+                ),
+                lang="eng",
+            )
+            # OVR is numeric-only. Do not strip arbitrary OCR characters,
+            # because that could turn a misread such as "9|1" into 91.
+            normalized_text = re.sub(r"\s+", "", text)
+            if re.fullmatch(r"\d{2,3}", normalized_text):
+                value = int(normalized_text)
+                if 1 <= value <= 200:
+                    return value
+    return None
+
+
+_CARD_LEVEL_TEMPLATES = None
+
+
+def _load_card_level_templates():
+    global _CARD_LEVEL_TEMPLATES
+    if _CARD_LEVEL_TEMPLATES is not None:
+        return _CARD_LEVEL_TEMPLATES
+
+    templates = []
+    for level in range(1, 14):
+        path = resource_path(
+            os.path.join("templates", f"card_level_{level}.png")
+        )
+        template = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+        if template is None:
+            raise FileNotFoundError(
+                f"Không load được template cấp thẻ: {path}"
+            )
+        templates.append((level, template))
+    _CARD_LEVEL_TEMPLATES = tuple(templates)
+    return _CARD_LEVEL_TEMPLATES
+
+
+def _match_card_level_template(screen, roi_box, threshold=0.62):
+    height, width = screen.shape[:2]
+    left, top, right, bottom = roi_box
+    scale_x = width / 1280
+    scale_y = height / 752
+    roi = screen[
+        int(top * scale_y):int(bottom * scale_y),
+        int(left * scale_x):int(right * scale_x),
+    ]
+    if roi.size == 0:
+        return None
+
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    best = None
+    for level, template in _load_card_level_templates():
+        scaled = cv2.resize(
+            template,
+            (
+                max(1, int(round(template.shape[1] * scale_x))),
+                max(1, int(round(template.shape[0] * scale_y))),
+            ),
+            interpolation=cv2.INTER_AREA,
+        )
+        if (
+            scaled.shape[0] > gray.shape[0]
+            or scaled.shape[1] > gray.shape[1]
+        ):
+            continue
+
+        for candidate in (gray, cv2.equalizeHist(gray)):
+            result = cv2.matchTemplate(
+                candidate,
+                scaled,
+                cv2.TM_CCOEFF_NORMED,
+            )
+            confidence = float(cv2.minMaxLoc(result)[1])
+            if best is None or confidence > best[1]:
+                best = (level, confidence)
+
+    if best is None or best[1] < threshold:
+        return None
+    return best
+
+
+def _read_player_card_level(screen, row_y):
+    badge_roi = (
+        910,
+        row_y - 11,
+        940,
+        row_y + 11,
+    )
+    match = _match_card_level_template(screen, badge_roi)
+    return None if match is None else match[0]
+
+
+def _read_player_card_level_ocr(screen, row_y):
+    height, width = screen.shape[:2]
+    left, top, right, bottom = PLAYER_CARD_LEVEL_ROI
+    scale_x = width / 1280
+    scale_y = height / 752
+    row_half_height = (bottom - top) / 2
+    roi = screen[
+        int((row_y - row_half_height) * scale_y):
+        int((row_y + row_half_height) * scale_y),
+        int(left * scale_x):int(right * scale_x),
+    ]
+    if roi.size == 0:
+        return None
+
+    # Read the badge itself first. The surrounding table contains OVR,
+    # position arrows, and player text; a broad ROI lets those elements
+    # suppress the small level glyph during OCR.
+    badge_left = int(910 * scale_x)
+    badge_right = int(940 * scale_x)
+    badge_top = int((row_y - 11) * scale_y)
+    badge_bottom = int((row_y + 11) * scale_y)
+    badge_roi = screen[badge_top:badge_bottom, badge_left:badge_right]
+    if badge_roi.size:
+        badge_gray = cv2.cvtColor(badge_roi, cv2.COLOR_BGR2GRAY)
+        badge_scaled = cv2.resize(
+            badge_gray,
+            None,
+            fx=14,
+            fy=14,
+            interpolation=cv2.INTER_CUBIC,
+        )
+        badge_scaled = cv2.copyMakeBorder(
+            badge_scaled,
+            30,
+            30,
+            30,
+            30,
+            cv2.BORDER_CONSTANT,
+            value=0,
+        )
+        badge_variants = (
+            badge_scaled,
+            cv2.threshold(
+                badge_scaled,
+                0,
+                255,
+                cv2.THRESH_BINARY + cv2.THRESH_OTSU,
+            )[1],
+            cv2.threshold(
+                badge_scaled,
+                0,
+                255,
+                cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU,
+            )[1],
+        )
+        for badge_variant in badge_variants:
+            for psm in (7, 8, 10, 13):
+                badge_text = pytesseract.image_to_string(
+                    badge_variant,
+                    config=(
+                        f"--psm {psm} "
+                        "-c tessedit_char_whitelist=0123456789"
+                    ),
+                    lang="eng",
+                )
+                badge_text = re.sub(r"\s+", "", badge_text)
+                if re.fullmatch(r"(?:[1-9]|1[0-3])", badge_text):
+                    return int(badge_text)
+
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    enlarged = cv2.resize(
+        gray,
+        None,
+        fx=6,
+        fy=6,
+        interpolation=cv2.INTER_CUBIC,
+    )
+    # Remove the badge border/background before OCR. This is especially
+    # important for level 1, whose single narrow stroke is easy to lose.
+    inner = enlarged[
+        max(0, int(enlarged.shape[0] * 0.06)):
+        int(enlarged.shape[0] * 0.94),
+        max(0, int(enlarged.shape[1] * 0.06)):
+        int(enlarged.shape[1] * 0.94),
+    ]
+    # Fast path: two focused OCR passes cover normal badges and the
+    # low-contrast digits without running every Tesseract PSM.
+    padded = cv2.copyMakeBorder(
+        enlarged,
+        12,
+        12,
+        12,
+        12,
+        cv2.BORDER_CONSTANT,
+        value=0,
+    )
+    fast_variants = (
+        padded,
+        cv2.threshold(
+            padded,
+            0,
+            255,
+            cv2.THRESH_BINARY + cv2.THRESH_OTSU,
+        )[1],
+    )
+    candidates = []
+    for variant in fast_variants:
+        for psm in (7, 10, 13):
+            text = pytesseract.image_to_string(
+                variant,
+                config=(
+                    f"--psm {psm} "
+                    "-c tessedit_char_whitelist=0123456789"
+                ),
+                lang="eng",
+            )
+            # Whitespace around the OCR token is harmless; any other
+            # character makes the result invalid.
+            normalized_text = re.sub(r"\s+", "", text)
+            if re.fullmatch(r"(?:[1-9]|1[0-3])", normalized_text):
+                candidates.append(int(normalized_text))
+
+    # Direct badge pass for small single-digit levels such as the +6 shown
+    # beside OVR 82. Keep the original badge proportions and use a narrow
+    # numeric whitelist so neighboring columns cannot affect the result.
+    direct_badge = cv2.resize(
+        gray,
+        None,
+        fx=10,
+        fy=10,
+        interpolation=cv2.INTER_CUBIC,
+    )
+    direct_variants = (
+        direct_badge,
+        cv2.threshold(
+            direct_badge,
+            0,
+            255,
+            cv2.THRESH_BINARY + cv2.THRESH_OTSU,
+        )[1],
+        cv2.threshold(
+            direct_badge,
+            0,
+            255,
+            cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU,
+        )[1],
+    )
+    for variant in direct_variants:
+        for psm in (8, 10, 13):
+            text = pytesseract.image_to_string(
+                variant,
+                config=(
+                    f"--psm {psm} "
+                    "-c tessedit_char_whitelist=0123456789"
+                ),
+                lang="eng",
+            )
+            normalized_text = re.sub(r"\s+", "", text)
+            if re.fullmatch(r"(?:[1-9]|1[0-3])", normalized_text):
+                candidates.append(int(normalized_text))
+
+    # Fallback only for difficult badges. It uses the trimmed ROI and two
+    # alternate segmentation modes, so the common path remains fast.
+    if not candidates and inner.size:
+        fallback = cv2.copyMakeBorder(
+            inner,
+            12,
+            12,
+            12,
+            12,
+            cv2.BORDER_CONSTANT,
+            value=0,
+        )
+        fallback_variants = (
+            fallback,
+            cv2.threshold(
+                fallback,
+                0,
+                255,
+                cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU,
+            )[1],
+        )
+        for variant in fallback_variants:
+            for psm in (10, 13):
+                text = pytesseract.image_to_string(
+                    variant,
+                    config=(
+                        f"--psm {psm} "
+                        "-c tessedit_char_whitelist=0123456789"
+                    ),
+                    lang="eng",
+                )
+                normalized_text = re.sub(r"\s+", "", text)
+                if re.fullmatch(r"(?:[1-9]|1[0-3])", normalized_text):
+                    candidates.append(int(normalized_text))
+
+    if not candidates:
+        # The game badge is always a positive level. If OCR cannot resolve
+        # the tiny glyph, keep the player eligible with the safest default.
+        return 1
+    return Counter(candidates).most_common(1)[0][0]
+
+
+def _player_identity(screen, row_y):
+    height, width = screen.shape[:2]
+    left, top, right, bottom = PLAYER_ID_ROI
+    scale_x = width / 1280
+    scale_y = height / 752
+    row_half_height = (bottom - top) / 2
+    roi = screen[
+        int((row_y - row_half_height) * scale_y):
+        int((row_y + row_half_height) * scale_y),
+        int(left * scale_x):int(right * scale_x),
+    ]
+    if roi.size == 0:
+        return None
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    reduced = cv2.resize(gray, (45, 6), interpolation=cv2.INTER_AREA)
+    return hashlib.sha1(reduced.tobytes()).digest()
+
+
+def _player_list_signature(screen):
+    height, width = screen.shape[:2]
+    left, top, right, bottom = PLAYER_LIST_ROI
+    scale_x = width / 1280
+    scale_y = height / 752
+    roi = screen[
+        int(top * scale_y):int(bottom * scale_y),
+        int(left * scale_x):int(right * scale_x),
+    ]
+    if roi.size == 0:
+        return None
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    reduced = cv2.resize(gray, (32, 24), interpolation=cv2.INTER_AREA)
+    return hashlib.sha1(reduced.tobytes()).digest()
+
+
+def _upgrade_rate_is_full(screen):
+    height, width = screen.shape[:2]
+    left, top, right, bottom = UPGRADE_RATE_ROI
+    scale_x = width / 1280
+    scale_y = height / 752
+    roi = screen[
+        int(top * scale_y):int(bottom * scale_y),
+        int(left * scale_x):int(right * scale_x),
+    ]
+    if roi.size == 0:
+        return False
+
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    slot_width = gray.shape[1] / MAX_UPGRADE_PLAYERS
+    filled_slots = 0
+    for index in range(MAX_UPGRADE_PLAYERS):
+        start = int(index * slot_width)
+        end = int((index + 1) * slot_width)
+        slot = gray[:, start:end]
+        if slot.size and float((slot >= 105).mean()) >= 0.12:
+            filled_slots += 1
+    return filled_slots >= MAX_UPGRADE_PLAYERS
+
+
+def _upgrade_button_is_green(screen):
+    height, width = screen.shape[:2]
+    left, top, right, bottom = UPGRADE_CONFIRM_ROI
+    scale_x = width / 1280
+    scale_y = height / 752
+    roi = screen[
+        int(top * scale_y):int(bottom * scale_y),
+        int(left * scale_x):int(right * scale_x),
+    ]
+    if roi.size == 0:
+        return False
+
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    green_pixels = cv2.inRange(
+        hsv,
+        np.array([35, 100, 100], dtype=np.uint8),
+        np.array([90, 255, 255], dtype=np.uint8),
+    )
+    return float(np.count_nonzero(green_pixels)) / green_pixels.size >= 0.20
+
+
+def _wait_for_upgrade_button(hwnd, timeout=10.0):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if _upgrade_stop_requested():
+            return False
+        if _upgrade_button_is_green(capture_fco(hwnd)):
+            return True
+        time.sleep(0.15)
+    return False
+
+
+def _skip_prompt_is_visible(screen):
+    height, width = screen.shape[:2]
+    left, top, right, bottom = SKIP_PROMPT_ROI
+    scale_x = width / 1280
+    scale_y = height / 752
+    roi = screen[
+        int(top * scale_y):int(bottom * scale_y),
+        int(left * scale_x):int(right * scale_x),
+    ]
+    if roi.size == 0:
+        return False
+
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    enlarged = cv2.resize(
+        gray,
+        None,
+        fx=4,
+        fy=4,
+        interpolation=cv2.INTER_CUBIC,
+    )
+    for variant in (
+        enlarged,
+        cv2.threshold(
+            enlarged,
+            0,
+            255,
+            cv2.THRESH_BINARY + cv2.THRESH_OTSU,
+        )[1],
+    ):
+        text = pytesseract.image_to_string(
+            variant,
+            config="--psm 7",
+            lang="eng",
+        ).lower()
+        normalized = unicodedata.normalize("NFKD", text)
+        normalized = "".join(
+            character
+            for character in normalized
+            if not unicodedata.combining(character)
+        )
+        normalized = re.sub(r"[^a-z0-9]+", " ", normalized)
+        if "bo qua" in normalized:
+            return True
+    return False
+
+
+def _wait_for_skip_prompt(hwnd, timeout=15.0):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if _upgrade_stop_requested():
+            return False
+        if _skip_prompt_is_visible(capture_fco(hwnd)):
+            return True
+        time.sleep(0.2)
+    return False
+
+
+def _result_next_button_is_green(screen):
+    return _result_next_button_position(screen) is not None
+
+
+def _result_next_button_position(screen):
+    height, width = screen.shape[:2]
+    left, top, right, bottom = RESULT_NEXT_ROI
+    scale_x = width / 1280
+    scale_y = height / 752
+    roi = screen[
+        int(top * scale_y):int(bottom * scale_y),
+        int(left * scale_x):int(right * scale_x),
+    ]
+    if roi.size == 0:
+        return None
+
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    green_pixels = cv2.inRange(
+        hsv,
+        np.array([38, 120, 150], dtype=np.uint8),
+        np.array([85, 255, 255], dtype=np.uint8),
+    )
+    green_pixels = cv2.morphologyEx(
+        green_pixels,
+        cv2.MORPH_CLOSE,
+        np.ones((3, 3), dtype=np.uint8),
+    )
+    contours, _ = cv2.findContours(
+        green_pixels,
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE,
+    )
+    if not contours:
+        return None
+
+    contour = max(contours, key=cv2.contourArea)
+    contour_area = cv2.contourArea(contour)
+    roi_area = roi.shape[0] * roi.shape[1]
+    if contour_area < 700 or contour_area / roi_area < 0.12:
+        return None
+
+    contour_x, contour_y, contour_width, contour_height = cv2.boundingRect(
+        contour
+    )
+    aspect_ratio = contour_width / max(contour_height, 1)
+    if (
+        contour_width < 100
+        or contour_width > 180
+        or contour_height < 20
+        or contour_height > 45
+        or aspect_ratio < 3.0
+        or aspect_ratio > 7.0
+    ):
+        return None
+
+    center_x = left + (contour_x + contour_width / 2) / scale_x
+    center_y = top + (contour_y + contour_height / 2) / scale_y
+    if not (995 <= center_x <= 1135 and 695 <= center_y <= 730):
+        return None
+    return int(center_x), int(center_y)
+
+
+def _read_owned_card_level(screen):
+    match = _match_card_level_template(
+        screen,
+        OWNED_CARD_LEVEL_ROI,
+    )
+    return None if match is None else match[0]
+
+
+def _read_owned_card_level_ocr(screen):
+    height, width = screen.shape[:2]
+    left, top, right, bottom = OWNED_CARD_LEVEL_ROI
+    scale_x = width / 1280
+    scale_y = height / 752
+    roi = screen[
+        int(top * scale_y):int(bottom * scale_y),
+        int(left * scale_x):int(right * scale_x),
+    ]
+    if roi.size == 0:
+        return None
+
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    enlarged = cv2.resize(
+        gray,
+        None,
+        fx=8,
+        fy=8,
+        interpolation=cv2.INTER_CUBIC,
+    )
+    padded = cv2.copyMakeBorder(
+        enlarged,
+        24,
+        24,
+        24,
+        24,
+        cv2.BORDER_CONSTANT,
+        value=0,
+    )
+    variants = (
+        padded,
+        cv2.threshold(
+            padded,
+            0,
+            255,
+            cv2.THRESH_BINARY + cv2.THRESH_OTSU,
+        )[1],
+        cv2.threshold(
+            padded,
+            0,
+            255,
+            cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU,
+        )[1],
+        cv2.adaptiveThreshold(
+            padded,
+            255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY,
+            31,
+            5,
+        ),
+    )
+    candidates = []
+    for variant in variants:
+        for psm in (10, 13):
+            text = pytesseract.image_to_string(
+                variant,
+                config=(
+                    f"--psm {psm} "
+                    "-c tessedit_char_whitelist=0123456789"
+                ),
+                lang="eng",
+            )
+            for match in re.finditer(r"\d{1,2}", text):
+                value = int(match.group(0))
+                if 0 <= value <= 20:
+                    candidates.append(value)
+    if not candidates:
+        return None
+    return Counter(candidates).most_common(1)[0][0]
+
+
+def _wait_for_result_screen(hwnd, timeout=15.0):
+    deadline = time.time() + timeout
+    stable_position = None
+    stable_reads = 0
+    first_detection_at = None
+    while time.time() < deadline:
+        if _upgrade_stop_requested():
+            return None
+        screen = capture_fco(hwnd)
+        position = _result_next_button_position(screen)
+        if position is not None:
+            if first_detection_at is None:
+                first_detection_at = time.time()
+            if time.time() - first_detection_at < 0.5:
+                time.sleep(0.2)
+                continue
+            if position == stable_position:
+                stable_reads += 1
+            else:
+                stable_position = position
+                stable_reads = 1
+            if stable_reads >= 6:
+                return screen
+        else:
+            stable_position = None
+            stable_reads = 0
+            first_detection_at = None
+        time.sleep(0.2)
+    return None
+
+
+def _wait_for_owned_card_level(hwnd, timeout=5.0):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if _upgrade_stop_requested():
+            return None
+        level = _read_owned_card_level(capture_fco(hwnd))
+        if level is not None:
+            return level
+        time.sleep(0.2)
+    return None
+
+
+def _wait_for_owned_players_tab(hwnd, timeout=5.0):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if _upgrade_stop_requested():
+            return False
+        if _owned_players_tab_selected(capture_fco(hwnd)):
+            return True
+        time.sleep(0.2)
+    return False
+
+
+def _wait_for_player_list_ready(hwnd, timeout=8.0):
+    deadline = time.time() + timeout
+    previous_signature = None
+    stable_captures = 0
+    while time.time() < deadline:
+        if _upgrade_stop_requested():
+            return False
+        signature = _player_list_signature(capture_fco(hwnd))
+        if signature is not None and signature == previous_signature:
+            stable_captures += 1
+            if stable_captures >= 3:
+                return True
+        else:
+            stable_captures = 0
+            previous_signature = signature
+        time.sleep(0.25)
+    return False
+
+
+def _select_player_in_stat_range(
+    hwnd,
+    stat_min,
+    stat_max,
+    allowed_card_levels,
+    log_upgrade,
+):
+    selected_count = 0
+    selected_players = set()
+    previous_list_signature = None
+    previous_low_last_row_ovr = None
+    repeated_low_ovr_pages = 0
+
+    def switch_to_bulk_purchase(reason):
+        log_upgrade(reason)
+        log_upgrade("➡️ Đang chuyển sang tab Mua hàng loạt.")
+        _upgrade_click(
+            hwnd,
+            BUY_BULK_TAB_POSITION[0],
+            BUY_BULK_TAB_POSITION[1],
+        )
+
+    for scroll_index in range(PLAYER_LIST_MAX_SCROLLS + 1):
+        if _upgrade_stop_requested():
+            return False
+        screen = capture_fco(hwnd)
+        list_signature = _player_list_signature(screen)
+        if (
+            previous_list_signature is not None
+            and list_signature == previous_list_signature
+        ):
+            log_upgrade(
+                "⚠️ Danh sách chưa thay đổi sau khi scroll; "
+                "đã đến cuối danh sách."
+            )
+            log_upgrade(
+                "➡️ Đang chuyển sang tab Mua hàng loạt."
+            )
+            _upgrade_click(
+                hwnd,
+                BUY_BULK_TAB_POSITION[0],
+                BUY_BULK_TAB_POSITION[1],
+            )
+            return False
+
+        previous_list_signature = list_signature
+        first_row_y = PLAYER_ROW_FIRST_Y
+        first_row_ovr = _read_player_ovr(screen, first_row_y)
+        last_row_y = PLAYER_ROW_FIRST_Y + (
+            PLAYER_ROW_COUNT - 1
+        ) * PLAYER_ROW_STEP_Y
+        last_row_ovr = _read_player_ovr(screen, last_row_y)
+        page_ovr_cache = {
+            first_row_y: first_row_ovr,
+            last_row_y: last_row_ovr,
+        }
+        log_upgrade(
+            f"🔎 Kiểm tra OVR cuối danh sách (dòng {PLAYER_ROW_COUNT}, "
+            f"cuộn {scroll_index}): "
+            f"{last_row_ovr if last_row_ovr is not None else 'không đọc được'}."
+        )
+        if first_row_ovr is not None and first_row_ovr > stat_max:
+            switch_to_bulk_purchase(
+                f"⚠️ OVR đầu danh sách {first_row_ovr} đã lớn hơn MAX "
+                f"{stat_max}; không còn cầu thủ phù hợp."
+            )
+            return False
+        if last_row_ovr is not None and last_row_ovr < stat_min:
+            if last_row_ovr == previous_low_last_row_ovr:
+                repeated_low_ovr_pages += 1
+            else:
+                repeated_low_ovr_pages = 1
+            previous_low_last_row_ovr = last_row_ovr
+        else:
+            previous_low_last_row_ovr = None
+            repeated_low_ovr_pages = 0
+
+        if repeated_low_ovr_pages >= 2:
+            log_upgrade(
+                f"⚠️ OVR cuối {last_row_ovr} thấp hơn MIN {stat_min} "
+                "trên nhiều trang liên tiếp; đã đến cuối danh sách."
+            )
+            log_upgrade("➡️ Đang chuyển sang tab Mua hàng loạt.")
+            _upgrade_click(
+                hwnd,
+                BUY_BULK_TAB_POSITION[0],
+                BUY_BULK_TAB_POSITION[1],
+            )
+            return False
+
+        if last_row_ovr is not None and last_row_ovr < stat_min:
+            if scroll_index >= PLAYER_LIST_MAX_SCROLLS:
+                log_upgrade(
+                    f"⚠️ Đã đến cuối danh sách nhưng OVR cuối {last_row_ovr} "
+                    f"vẫn thấp hơn MIN {stat_min}; đang chuyển sang tab "
+                    "Mua hàng loạt."
+                )
+                _upgrade_click(
+                    hwnd,
+                    BUY_BULK_TAB_POSITION[0],
+                    BUY_BULK_TAB_POSITION[1],
+                )
+                return False
+            log_upgrade(
+                f"↕️ OVR cuối {last_row_ovr} vẫn thấp hơn MIN {stat_min}; "
+                "cuộn khoảng 10 vị trí để tìm tiếp."
+            )
+            scroll_client(
+                hwnd,
+                PLAYER_LIST_SCROLL_POSITION[0],
+                PLAYER_LIST_SCROLL_POSITION[1],
+                PLAYER_LIST_SCROLL_NOTCHES,
+            )
+            time.sleep(1.0)
+            continue
+
+        valid_found_on_page = False
+        for row_index in range(PLAYER_ROW_COUNT):
+            if _upgrade_stop_requested():
+                return False
+            row_y = PLAYER_ROW_FIRST_Y + row_index * PLAYER_ROW_STEP_Y
+            ovr = page_ovr_cache.get(row_y)
+            if row_y not in page_ovr_cache:
+                ovr = _read_player_ovr(screen, row_y)
+                page_ovr_cache[row_y] = ovr
+            log_upgrade(
+                f"🔎 Dòng {row_index + 1} (cuộn {scroll_index}): OVR "
+                f"{ovr if ovr is not None else 'không đọc được'}."
+            )
+            if ovr is None or not stat_min <= ovr <= stat_max:
+                continue
+
+            valid_found_on_page = True
+            card_level = _read_player_card_level(screen, row_y)
+            log_upgrade(
+                f"🃏 Dòng {row_index + 1} (cuộn {scroll_index}): "
+                f"cấp thẻ {card_level if card_level is not None else 'không đọc được'}."
+            )
+            if card_level is None or card_level not in allowed_card_levels:
+                log_upgrade(
+                    f"↪️ Bỏ qua dòng {row_index + 1}: cấp thẻ "
+                    f"{card_level if card_level is not None else 'không đọc được'} "
+                    f"không nằm trong danh sách {sorted(allowed_card_levels)}."
+                )
+                continue
+
+            player_id = _player_identity(screen, row_y)
+            if player_id is None:
+                log_upgrade(
+                    f"⚠️ Bỏ qua dòng {row_index + 1}: không xác định được "
+                    "danh tính cầu thủ."
+                )
+                continue
+            if player_id in selected_players:
+                log_upgrade(
+                    f"↪️ Bỏ qua dòng {row_index + 1}: cầu thủ này đã được chọn."
+                )
+                continue
+
+            latest_screen = capture_fco(hwnd)
+            latest_ovr = _read_player_ovr(latest_screen, row_y)
+            latest_card_level = _read_player_card_level(latest_screen, row_y)
+            if (
+                latest_ovr is None
+                or latest_ovr != ovr
+                or not stat_min <= latest_ovr <= stat_max
+            ):
+                log_upgrade(
+                    f"⚠️ Bỏ qua dòng {row_index + 1}: OVR đọc lại là "
+                    f"{latest_ovr if latest_ovr is not None else 'không đọc được'}, "
+                    f"không thuộc phạm vi {stat_min}-{stat_max}."
+                )
+                screen = latest_screen
+                continue
+            if latest_card_level is None or latest_card_level not in allowed_card_levels:
+                log_upgrade(
+                    f"⚠️ Bỏ qua dòng {row_index + 1}: cấp thẻ đọc lại là "
+                    f"{latest_card_level if latest_card_level is not None else 'không đọc được'} "
+                    f"không nằm trong danh sách {sorted(allowed_card_levels)}."
+                )
+                screen = latest_screen
+                continue
+
+            latest_player_id = _player_identity(latest_screen, row_y)
+            if latest_player_id != player_id:
+                log_upgrade(
+                    f"⚠️ Bỏ qua dòng {row_index + 1}: cầu thủ đã thay đổi "
+                    "trước khi click."
+                )
+                screen = latest_screen
+                continue
+
+            _upgrade_click(hwnd, PLAYER_ROW_CLICK_X, row_y)
+            selected_players.add(player_id)
+            selected_count += 1
+            log_upgrade(
+                f"✅ Đã chọn cầu thủ thứ {selected_count} ở dòng {row_index + 1}, "
+                f"OVR {ovr} (phạm vi {stat_min}-{stat_max})."
+            )
+            time.sleep(0.3)
+            screen = capture_fco(hwnd)
+            if _upgrade_rate_is_full(screen):
+                log_upgrade("✅ Tỉ lệ nâng cấp đã đủ 5 vạch.")
+                return True
+            if selected_count >= MAX_UPGRADE_PLAYERS:
+                log_upgrade("✅ Đã chọn đủ 5 cầu thủ nâng cấp.")
+                return True
+
+        if scroll_index >= PLAYER_LIST_MAX_SCROLLS:
+            break
+
+        if not valid_found_on_page:
+            log_upgrade(
+                f"↕️ Không có cầu thủ hợp lệ ở danh sách hiện tại; "
+                f"đang cuộn xuống lần {scroll_index + 1}."
+            )
+        else:
+            log_upgrade(
+                f"↕️ Đã quét xong các cầu thủ hợp lệ trong danh sách hiện tại; "
+                f"đang cuộn xuống lần {scroll_index + 1}."
+            )
+        scroll_client(
+            hwnd,
+            PLAYER_LIST_SCROLL_POSITION[0],
+            PLAYER_LIST_SCROLL_POSITION[1],
+            PLAYER_LIST_SCROLL_NOTCHES,
+        )
+        time.sleep(1.0)
+
+    log_upgrade(
+        f"⚠️ Đã chọn {selected_count}/5 cầu thủ; "
+        f"không còn cầu thủ phù hợp trong khoảng {stat_min}-{stat_max}."
+    )
+    log_upgrade(
+        "➡️ Đã quét hết danh sách; đang chuyển sang tab Mua hàng loạt "
+        f"tại {BUY_BULK_TAB_POSITION[0]}, {BUY_BULK_TAB_POSITION[1]}."
+    )
+    _upgrade_click(
+        hwnd,
+        BUY_BULK_TAB_POSITION[0],
+        BUY_BULK_TAB_POSITION[1],
+    )
+    return False
+
+
+def open_upgrade():
+    global upgrade_window, upgrade_layout
+
+    if upgrade_window is not None and upgrade_window.winfo_exists():
+        return
+
+    if player_insert_window is not None and player_insert_window.winfo_exists():
+        show_auto_buy()
+
+    auto_buy_tab.configure(fg_color="transparent", text_color=MUTED)
+    player_insert_tab.configure(fg_color="transparent", text_color=MUTED)
+    upgrade_tab.configure(fg_color="transparent", text_color=GREEN)
+    auto_buy_indicator.configure(fg_color="transparent")
+    player_insert_indicator.configure(fg_color="transparent")
+    upgrade_indicator.configure(fg_color=GREEN)
+
+    upgrade_layout = _hide_main_content()
+    upgrade_window = ctk.CTkFrame(main, fg_color="transparent", corner_radius=0)
+    upgrade_window.pack(fill="both", expand=True)
+
+    title_bar = ctk.CTkFrame(
+        upgrade_window,
+        fg_color="transparent",
+    )
+    title_bar.pack(fill="x", padx=18, pady=(12, 5))
+    title_bar.grid_columnconfigure(0, weight=1)
+    title_bar.grid_columnconfigure(1, weight=1)
+    title_bar.grid_columnconfigure(2, weight=1)
+    ctk.CTkLabel(
+        title_bar,
+        text="ĐẬP CẦU THỦ",
+        text_color=GREEN,
+        font=ctk.CTkFont(size=16, weight="bold"),
+    ).grid(row=0, column=1)
+    profile_actions = ctk.CTkFrame(
+        title_bar,
+        fg_color="transparent",
+    )
+    profile_actions.grid(row=0, column=2, sticky="e")
+    stat_config = ctk.CTkFrame(upgrade_window, fg_color=CARD)
+    stat_config.pack(fill="x", padx=18, pady=(0, 10))
+    for column in range(3):
+        stat_config.grid_columnconfigure(column, weight=1)
+
+    ctk.CTkLabel(
+        stat_config,
+        text="CHỈ SỐ MIN",
+        text_color=MUTED,
+        font=ctk.CTkFont(size=9, weight="bold"),
+    ).grid(row=0, column=0, sticky="w", padx=(12, 6), pady=(8, 0))
+    ctk.CTkLabel(
+        stat_config,
+        text="CHỈ SỐ MAX",
+        text_color=MUTED,
+        font=ctk.CTkFont(size=9, weight="bold"),
+    ).grid(row=0, column=1, sticky="w", padx=(6, 12), pady=(8, 0))
+    ctk.CTkLabel(
+        stat_config,
+        text="MỨC ĐÍCH",
+        text_color=MUTED,
+        font=ctk.CTkFont(size=9, weight="bold"),
+    ).grid(row=0, column=2, sticky="w", padx=(6, 12), pady=(8, 0))
+
+    upgrade_stat_min_entry = ctk.CTkEntry(
+        stat_config,
+        height=30,
+        fg_color=INNER_COLOR,
+        border_color="#3B4A55",
+        text_color=TEXT,
+        font=ctk.CTkFont(size=11, weight="bold"),
+    )
+    upgrade_stat_min_entry.grid(
+        row=1, column=0, sticky="ew", padx=(12, 6), pady=(3, 10)
+    )
+    upgrade_stat_min_entry.insert(0, "1")
+
+    upgrade_stat_max_entry = ctk.CTkEntry(
+        stat_config,
+        height=30,
+        fg_color=INNER_COLOR,
+        border_color="#3B4A55",
+        text_color=TEXT,
+        font=ctk.CTkFont(size=11, weight="bold"),
+    )
+    upgrade_stat_max_entry.grid(
+        row=1, column=1, sticky="ew", padx=6, pady=(3, 10)
+    )
+    upgrade_stat_max_entry.insert(0, "999")
+
+    upgrade_card_level_vars = {}
+    ctk.CTkLabel(
+        stat_config,
+        text="MỨC THẺ ĐẬP (CHỌN NHIỀU)",
+        text_color=MUTED,
+        font=ctk.CTkFont(size=9, weight="bold"),
+    ).grid(
+        row=2,
+        column=0,
+        columnspan=3,
+        sticky="w",
+        padx=12,
+        pady=(0, 3),
+    )
+    card_levels_frame = ctk.CTkFrame(
+        stat_config,
+        fg_color=INNER_COLOR,
+        corner_radius=4,
+    )
+    card_levels_frame.grid(
+        row=3,
+        column=0,
+        columnspan=3,
+        sticky="ew",
+        padx=12,
+        pady=(0, 10),
+    )
+    for level in range(1, 14):
+        variable = ctk.BooleanVar(value=level <= 3)
+        upgrade_card_level_vars[level] = variable
+        checkbox = ctk.CTkCheckBox(
+            card_levels_frame,
+            text=f"+{level}",
+            variable=variable,
+            onvalue=True,
+            offvalue=False,
+            width=38,
+            height=20,
+            checkbox_width=14,
+            checkbox_height=14,
+            corner_radius=3,
+            border_width=1,
+            font=ctk.CTkFont(size=9),
+        )
+        checkbox.grid(
+            row=(level - 1) // 5,
+            column=(level - 1) % 5,
+            sticky="w",
+            padx=(4, 0),
+            pady=(3 if level <= 5 else 0, 3 if level > 10 else 0),
+        )
+
+    upgrade_target_level_entry = ctk.CTkEntry(
+        stat_config,
+        height=30,
+        fg_color=INNER_COLOR,
+        border_color="#3B4A55",
+        text_color=TEXT,
+        font=ctk.CTkFont(size=11, weight="bold"),
+    )
+    upgrade_target_level_entry.grid(
+        row=1, column=2, sticky="ew", padx=(6, 12), pady=(3, 10)
+    )
+    upgrade_target_level_entry.insert(0, "5")
+
+    purchase_config = ctk.CTkFrame(upgrade_window, fg_color=CARD)
+    purchase_config.pack(fill="x", padx=18, pady=(0, 10))
+    purchase_config.grid_columnconfigure(0, weight=1)
+    purchase_config.grid_columnconfigure(1, weight=1)
+
+    ctk.CTkLabel(
+        purchase_config,
+        text="SỐ PHÔI CẦN MUA",
+        text_color=MUTED,
+        font=ctk.CTkFont(size=9, weight="bold"),
+    ).grid(row=0, column=0, sticky="w", padx=(12, 6), pady=(8, 0))
+    ctk.CTkLabel(
+        purchase_config,
+        text="GIÁ TỐI ĐA / PHÔI",
+        text_color=MUTED,
+        font=ctk.CTkFont(size=9, weight="bold"),
+    ).grid(row=0, column=1, sticky="w", padx=(6, 12), pady=(8, 0))
+
+    upgrade_purchase_quantity_entry = ctk.CTkEntry(
+        purchase_config,
+        height=30,
+        fg_color=INNER_COLOR,
+        border_color="#3B4A55",
+        text_color=TEXT,
+        font=ctk.CTkFont(size=11, weight="bold"),
+    )
+    upgrade_purchase_quantity_entry.grid(
+        row=1, column=0, sticky="ew", padx=(12, 6), pady=(3, 10)
+    )
+    upgrade_purchase_quantity_entry.insert(0, "1")
+
+    upgrade_purchase_price_entry = ctk.CTkEntry(
+        purchase_config,
+        height=30,
+        fg_color=INNER_COLOR,
+        border_color="#3B4A55",
+        text_color=TEXT,
+        font=ctk.CTkFont(size=11, weight="bold"),
+    )
+    upgrade_purchase_price_entry.grid(
+        row=1, column=1, sticky="ew", padx=(6, 12), pady=(3, 10)
+    )
+    upgrade_purchase_price_entry.insert(0, "10,000")
+
+    def format_upgrade_purchase_price(_event=None):
+        value = re.sub(
+            r"[^\d]",
+            "",
+            upgrade_purchase_price_entry.get(),
+        )
+        formatted = f"{int(value):,}" if value else ""
+        if upgrade_purchase_price_entry.get() != formatted:
+            upgrade_purchase_price_entry.delete(0, "end")
+            upgrade_purchase_price_entry.insert(0, formatted)
+
+    upgrade_purchase_price_entry.bind(
+        "<FocusOut>",
+        format_upgrade_purchase_price,
+    )
+
+    purchased_materials_label = ctk.CTkLabel(
+        purchase_config,
+        text="ĐÃ MUA: 0",
+        text_color=GREEN,
+        font=ctk.CTkFont(size=10, weight="bold"),
+        anchor="w",
+    )
+    purchased_materials_label.grid(
+        row=2,
+        column=0,
+        columnspan=2,
+        sticky="w",
+        padx=12,
+        pady=(0, 8),
+    )
+
+    log_box = ctk.CTkTextbox(upgrade_window, height=100)
+    log_box.pack(fill="both", expand=True, padx=18, pady=(0, 8))
+
+    def log_upgrade(message):
+        print(message)
+        app.after(
+            0,
+            lambda: (log_box.insert("end", message + "\n"), log_box.see("end")),
+        )
+
+    def update_purchased_materials_count(purchased, target):
+        app.after(
+            0,
+            lambda: purchased_materials_label.configure(
+                text=f"ĐÃ MUA: {purchased}/{target}"
+            ),
+        )
+
+    def reset_purchased_materials_count():
+        app.after(
+            0,
+            lambda: purchased_materials_label.configure(
+                text="ĐÃ MUA: 0"
+            ),
+        )
+
+    def stop_upgrade():
+        if upgrade_stop_event is not None:
+            upgrade_stop_event.set()
+        log_upgrade("⛔ Đã yêu cầu dừng đập cầu thủ.")
+
+    def save_upgrade_profile():
+        profiles["upgrade"] = {
+            "stat_min": upgrade_stat_min_entry.get(),
+            "stat_max": upgrade_stat_max_entry.get(),
+            "target_level": upgrade_target_level_entry.get(),
+            "card_levels": [
+                level
+                for level, variable in upgrade_card_level_vars.items()
+                if variable.get()
+            ],
+            "purchase_quantity": upgrade_purchase_quantity_entry.get(),
+            "purchase_price": upgrade_purchase_price_entry.get(),
+        }
+        if save_profiles():
+            log_upgrade("💾 Đã lưu profile Đập cầu thủ.")
+
+    def load_upgrade_profile():
+        saved_profile = profiles.get("upgrade")
+        if not isinstance(saved_profile, dict):
+            log_upgrade("ℹ️ Chưa có profile Đập cầu thủ đã lưu.")
+            return
+
+        for entry, key in (
+            (upgrade_stat_min_entry, "stat_min"),
+            (upgrade_stat_max_entry, "stat_max"),
+            (upgrade_target_level_entry, "target_level"),
+            (upgrade_purchase_quantity_entry, "purchase_quantity"),
+            (upgrade_purchase_price_entry, "purchase_price"),
+        ):
+            value = saved_profile.get(key)
+            if value is None:
+                continue
+            entry.delete(0, "end")
+            entry.insert(0, str(value))
+
+        saved_levels = saved_profile.get("card_levels")
+        if isinstance(saved_levels, list):
+            selected_levels = {
+                int(level)
+                for level in saved_levels
+                if isinstance(level, int) and 1 <= level <= 13
+            }
+            for level, variable in upgrade_card_level_vars.items():
+                variable.set(level in selected_levels)
+        log_upgrade("📂 Đã tải profile Đập cầu thủ.")
+
+    def start_upgrade():
+        global upgrade_stop_event
+        if upgrade_stop_event is not None and not upgrade_stop_event.is_set():
+            log_upgrade("⚠️ Luồng đập cầu thủ đang chạy.")
+            return
+        try:
+            stat_min = int(upgrade_stat_min_entry.get().strip())
+            stat_max = int(upgrade_stat_max_entry.get().strip())
+            allowed_card_levels = {
+                level
+                for level, variable in upgrade_card_level_vars.items()
+                if variable.get()
+            }
+            target_level = int(upgrade_target_level_entry.get().strip())
+            purchase_quantity = int(
+                upgrade_purchase_quantity_entry.get().strip()
+            )
+            purchase_price = int(
+                re.sub(r"[^\d]", "", upgrade_purchase_price_entry.get())
+            )
+        except ValueError:
+            log_upgrade("❌ Các giá trị cấu hình phải là số nguyên.")
+            messagebox.showerror(
+                "Cấu hình không hợp lệ",
+                "MIN, MAX, các mức thẻ đập và mức đích phải là số nguyên.",
+                parent=app,
+            )
+            return
+
+        if not allowed_card_levels:
+            log_upgrade(
+                "❌ Chưa chọn mức thẻ nào để đập."
+            )
+            messagebox.showerror(
+                "Cấu hình không hợp lệ",
+                "Hãy chọn ít nhất một mức thẻ từ +1 đến +13.",
+                parent=app,
+            )
+            return
+
+        if stat_min < 1 or stat_max < 1 or stat_min > stat_max:
+            log_upgrade(
+                "❌ Chỉ số không hợp lệ: MIN/MAX phải lớn hơn 0 và MIN không "
+                "được lớn hơn MAX."
+            )
+            messagebox.showerror(
+                "Cấu hình không hợp lệ",
+                (
+                    "Chỉ số MIN/MAX phải lớn hơn 0 và "
+                    "MIN không được lớn hơn MAX."
+                ),
+                parent=app,
+            )
+            return
+        if target_level < 1:
+            log_upgrade("❌ Mức thẻ cộng phải lớn hơn 0.")
+            messagebox.showerror(
+                "Cấu hình không hợp lệ",
+                "Mức thẻ cộng phải lớn hơn 0.",
+                parent=app,
+            )
+            return
+        if purchase_quantity < 1 or purchase_price < 1:
+            log_upgrade(
+                "❌ Số phôi cần mua và giá tối đa/phôi phải lớn hơn 0."
+            )
+            messagebox.showerror(
+                "Cấu hình không hợp lệ",
+                "Số phôi cần mua và giá tối đa/phôi phải lớn hơn 0.",
+                parent=app,
+            )
+            return
+
+        reset_purchased_materials_count()
+        hwnd = find_fc_online()
+        if hwnd is None:
+            log_upgrade("❌ Không tìm thấy FC ONLINE.")
+            messagebox.showerror(
+                "Không tìm thấy FC ONLINE",
+                "Không tìm thấy cửa sổ FC ONLINE.",
+                parent=app,
+            )
+            return
+        try:
+            detected = _upgrade_screen_detected(hwnd)
+        except (OSError, RuntimeError, pytesseract.TesseractError) as exc:
+            log_upgrade(f"❌ Không thể kiểm tra màn hình nâng cấp: {exc}")
+            messagebox.showerror(
+                "Lỗi kiểm tra giao diện",
+                f"Không thể kiểm tra giao diện đập cầu thủ:\n{exc}",
+                parent=app,
+            )
+            return
+        if not detected:
+            log_upgrade(
+                "❌ Chưa mở màn hình đập cầu thủ/nâng cấp. "
+                "Hãy mở màn hình nâng cấp rồi thử lại."
+            )
+            messagebox.showerror(
+                "Chưa mở giao diện đập cầu thủ",
+                (
+                    "Không tìm thấy giao diện đập cầu thủ.\n\n"
+                    "Hãy mở màn hình 'Nâng cấp cầu thủ' và chọn tab "
+                    "'Cầu thủ đang sở hữu', rồi thử lại."
+                ),
+                parent=app,
+            )
+            return
+        log_upgrade("✅ Đã nhận diện màn hình nâng cấp.")
+        log_upgrade(
+            f"🎯 Phạm vi chỉ số: {stat_min} - {stat_max}."
+        )
+        log_upgrade(
+            f"🎯 Các mức thẻ được phép đập: "
+            f"{', '.join(f'+{level}' for level in sorted(allowed_card_levels))}."
+        )
+        log_upgrade(f"🎯 Mục tiêu mức thẻ cộng: +{target_level}.")
+        log_upgrade(
+            f"🛒 Cấu hình mua phôi: {purchase_quantity} phôi, "
+            f"giá tối đa {purchase_price:,}/phôi."
+        )
+        upgrade_stop_event = threading.Event()
+
+        def run_upgrade_cycle():
+            if _upgrade_stop_requested():
+                return False
+            reset_purchased_materials_count()
+            try:
+                sorted_ascending = _sort_ovr_ascending(hwnd, log_upgrade)
+            except (OSError, RuntimeError) as exc:
+                log_upgrade(f"❌ Không thể sắp xếp cột OVR: {exc}")
+                app.after(
+                    0,
+                    lambda error=exc: messagebox.showerror(
+                        "Lỗi sắp xếp OVR",
+                        f"Không thể click cột OVR:\n{error}",
+                        parent=app,
+                    ),
+                )
+                return
+            except (cv2.error, ValueError, TypeError, NameError) as exc:
+                log_upgrade(f"❌ Lỗi xử lý ảnh/icon OVR: {exc}")
+                return
+            if not sorted_ascending:
+                log_upgrade("❌ Không chuyển được icon OVR sang tăng dần.")
+                app.after(
+                    0,
+                    lambda: messagebox.showerror(
+                        "Lỗi sắp xếp OVR",
+                        "Không xác nhận được icon OVR tăng dần sau các lần click.",
+                        parent=app,
+                    ),
+                )
+                return
+            try:
+                selected = _select_player_in_stat_range(
+                    hwnd,
+                    stat_min,
+                    stat_max,
+                    allowed_card_levels,
+                    log_upgrade,
+                )
+            except (OSError, RuntimeError, cv2.error, ValueError, TypeError) as exc:
+                log_upgrade(f"❌ Lỗi khi quét/chọn cầu thủ: {exc}")
+                app.after(
+                    0,
+                    lambda error=exc: messagebox.showerror(
+                        "Lỗi quét cầu thủ",
+                        f"Không thể quét hoặc chọn cầu thủ:\n{error}",
+                        parent=app,
+                    ),
+                )
+                return
+            if not selected:
+                if _upgrade_stop_requested():
+                    return
+                log_upgrade(
+                    f"🛒 Đã chuyển sang Mua hàng loạt; bắt đầu mua "
+                    f"{purchase_quantity} phôi, mỗi lần nhập số lượng 10, "
+                    f"giá tối đa {purchase_price:,}/phôi."
+                )
+                run_auto_buy(
+                    hwnd=hwnd,
+                    target_players=purchase_quantity,
+                    threshold=0.85,
+                    stat_min=stat_min,
+                    stat_max=stat_max,
+                    max_card_price=purchase_price,
+                    quantity=10,
+                    stop_event=upgrade_stop_event,
+                    log_callback=log_upgrade,
+                    player_count_callback=update_purchased_materials_count,
+                    notify_on_complete=False,
+                    mouse_method="message",
+                )
+                if _upgrade_stop_requested():
+                    return False
+                reset_purchased_materials_count()
+                log_upgrade(
+                    "✅ Đã mua đủ số phôi yêu cầu; đang quay lại tab "
+                    f"Cầu thủ đang sở hữu tại "
+                    f"{OWNED_PLAYERS_TAB_POSITION[0]}, "
+                    f"{OWNED_PLAYERS_TAB_POSITION[1]}."
+                )
+                _upgrade_click(
+                    hwnd,
+                    OWNED_PLAYERS_TAB_POSITION[0],
+                    OWNED_PLAYERS_TAB_POSITION[1],
+                )
+                if not _wait_for_owned_players_tab(hwnd):
+                    log_upgrade(
+                        "❌ Không xác nhận được tab Cầu thủ đang sở hữu "
+                        "sau khi mua phôi."
+                    )
+                    return False
+                log_upgrade("⏳ Đang chờ danh sách cầu thủ tải hoàn tất...")
+                if not _wait_for_player_list_ready(hwnd):
+                    log_upgrade(
+                        "❌ Danh sách cầu thủ chưa tải ổn định sau khi mua phôi."
+                    )
+                    return False
+                log_upgrade(
+                    "↕️ Đã quay lại tab Cầu thủ đang sở hữu; "
+                    "đang scroll lên để tìm phôi vừa mua."
+                )
+                scroll_client(
+                    hwnd,
+                    PLAYER_LIST_SCROLL_POSITION[0],
+                    PLAYER_LIST_SCROLL_POSITION[1],
+                    PURCHASED_PLAYERS_SCROLL_NOTCHES,
+                )
+                if upgrade_stop_event.wait(1.0):
+                    return False
+                log_upgrade(
+                    "🔁 Đã mua đủ phôi; bắt đầu lại toàn bộ quy trình "
+                    "đập cầu thủ."
+                )
+                return True
+            if _upgrade_stop_requested():
+                return False
+            log_upgrade(
+                "➡️ Đã chọn đủ vật liệu; đang bấm Tiếp theo "
+                f"tại {UPGRADE_NEXT_POSITION[0]}, {UPGRADE_NEXT_POSITION[1]}."
+            )
+            _upgrade_click(
+                hwnd,
+                UPGRADE_NEXT_POSITION[0],
+                UPGRADE_NEXT_POSITION[1],
+            )
+            if _upgrade_stop_requested():
+                return False
+            log_upgrade("⏳ Đang chờ màn hình nâng cấp hiển thị...")
+            if not _wait_for_upgrade_button(hwnd):
+                log_upgrade(
+                    "❌ Nút Nâng cấp chưa chuyển sang màu xanh trong thời gian chờ."
+                )
+                return
+            log_upgrade(
+                "⬆️ Màn hình nâng cấp đã hiển thị; đang bấm Nâng cấp "
+                f"tại {UPGRADE_CONFIRM_POSITION[0]}, "
+                f"{UPGRADE_CONFIRM_POSITION[1]}."
+            )
+            _upgrade_click(
+                hwnd,
+                UPGRADE_CONFIRM_POSITION[0],
+                UPGRADE_CONFIRM_POSITION[1],
+            )
+            if _upgrade_stop_requested():
+                return False
+            log_upgrade("⏳ Đang chờ hiển thị chữ Bỏ qua...")
+            if _wait_for_skip_prompt(hwnd):
+                log_upgrade(
+                    "␠ Đã thấy chữ Bỏ qua; gửi phím Space để kết thúc nhanh."
+                )
+                key_press(hwnd, win32con.VK_SPACE)
+            else:
+                log_upgrade(
+                    "⚠️ Không thấy chữ Bỏ qua trong thời gian chờ; "
+                    "không gửi phím Space."
+                )
+                return False
+
+            log_upgrade("⏳ Đang chờ nút Tiếp màu xanh sáng trên màn hình kết quả...")
+            result_screen = _wait_for_result_screen(hwnd)
+            if result_screen is None:
+                log_upgrade("❌ Không thấy nút Tiếp màu xanh trên màn hình kết quả.")
+                return False
+
+            result_next_position = _result_next_button_position(result_screen)
+            if result_next_position is None:
+                log_upgrade(
+                    "❌ Không xác định được vị trí nút Tiếp màu xanh sau khi "
+                    "đã phát hiện màn hình kết quả."
+                )
+                return False
+            log_upgrade(
+                "✅ Nút Tiếp đã xanh; đang bấm Tiếp tại "
+                f"{result_next_position[0]}, {result_next_position[1]}."
+            )
+            _upgrade_click(
+                hwnd,
+                result_next_position[0],
+                result_next_position[1],
+            )
+            result_level = _wait_for_owned_card_level(hwnd)
+            if result_level is None:
+                log_upgrade(
+                    "❌ Đã bấm Tiếp nhưng không đọc được mức Cấp thẻ "
+                    "ở panel bên trái."
+                )
+                return False
+            log_upgrade(
+                f"📈 Mức thẻ trên thẻ cầu thủ: +{result_level}; "
+                f"mục tiêu +{target_level}."
+            )
+            if result_level == target_level:
+                log_upgrade(
+                    f"✅ Đã đạt mục tiêu +{target_level}; dừng tool."
+                )
+                play_notification(log_upgrade)
+                return False
+
+            log_upgrade(
+                f"🔁 Chưa đạt mục tiêu +{target_level}; chuẩn bị đập lại."
+            )
+            if upgrade_stop_event.wait(1.0):
+                return False
+            return True
+
+        def sort_worker():
+            cycle = 1
+            while True:
+                if _upgrade_stop_requested():
+                    return
+                log_upgrade(f"🔄 Bắt đầu lần đập {cycle}.")
+                should_repeat = run_upgrade_cycle()
+                if not should_repeat:
+                    return
+                if _upgrade_stop_requested():
+                    return
+                cycle += 1
+
+        threading.Thread(target=sort_worker, daemon=True).start()
+
+    button_row = ctk.CTkFrame(upgrade_window, fg_color="transparent")
+    button_row.pack(
+        side="bottom",
+        fill="x",
+        padx=18,
+        pady=(0, 12),
+    )
+    ctk.CTkButton(
+        button_row,
+        text="▶ START",
+        command=start_upgrade,
+        fg_color="#16B95D",
+        hover_color=GREEN_HOVER,
+        width=150,
+    ).pack(side="left", expand=True, padx=(0, 5))
+    ctk.CTkButton(
+        button_row,
+        text="■ STOP",
+        command=stop_upgrade,
+        fg_color="#313A42",
+        hover_color="#3C4750",
+        width=100,
+    ).pack(side="left", expand=True, padx=5)
+
+    ctk.CTkButton(
+        profile_actions,
+        text="💾",
+        command=save_upgrade_profile,
+        width=30,
+        height=26,
+        fg_color="#313A42",
+        hover_color="#3C4750",
+        corner_radius=7,
+        font=ctk.CTkFont(size=13),
+    ).pack(side="left", padx=(0, 4))
+    ctk.CTkButton(
+        profile_actions,
+        text="📂",
+        command=load_upgrade_profile,
+        width=30,
+        height=26,
+        fg_color="#313A42",
+        hover_color="#3C4750",
+        corner_radius=7,
+        font=ctk.CTkFont(size=13),
+    ).pack(side="left")
+    load_upgrade_profile()
+
+
 def open_player_insert():
     global player_insert_window, player_insert_layout
 
     if player_insert_window is not None and player_insert_window.winfo_exists():
         return
+
+    if upgrade_window is not None and upgrade_window.winfo_exists():
+        show_auto_buy()
 
     auto_buy_tab.configure(
         fg_color="transparent",
@@ -1527,9 +3471,12 @@ def open_player_insert():
 
 
 def show_auto_buy():
-    global player_insert_window, player_insert_layout
+    global player_insert_window, player_insert_layout, upgrade_window, upgrade_layout
 
-    if player_insert_window is None or not player_insert_window.winfo_exists():
+    if (
+        (player_insert_window is None or not player_insert_window.winfo_exists())
+        and (upgrade_window is None or not upgrade_window.winfo_exists())
+    ):
         return
 
     auto_buy_tab.configure(
@@ -1540,19 +3487,30 @@ def show_auto_buy():
         fg_color="transparent",
         text_color=MUTED,
     )
+    upgrade_tab.configure(
+        fg_color="transparent",
+        text_color=MUTED,
+    )
     auto_buy_indicator.configure(fg_color=GREEN)
     player_insert_indicator.configure(fg_color="transparent")
+    upgrade_indicator.configure(fg_color="transparent")
 
     if player_insert_stop_event is not None:
         player_insert_stop_event.set()
 
-    player_insert_window.destroy()
-    player_insert_window = None
+    if player_insert_window is not None and player_insert_window.winfo_exists():
+        player_insert_window.destroy()
+        player_insert_window = None
+    if upgrade_window is not None and upgrade_window.winfo_exists():
+        upgrade_window.destroy()
+        upgrade_window = None
 
     if player_insert_layout is not None:
-        for widget, layout in player_insert_layout:
-            widget.pack(**layout)
+        _restore_main_content(player_insert_layout)
         player_insert_layout = None
+    if upgrade_layout is not None:
+        _restore_main_content(upgrade_layout)
+        upgrade_layout = None
 
 def _reset_matches_hour_for_ui(reset_code):
     return normalize_reset_code(reset_code)
@@ -1616,7 +3574,7 @@ topbar.pack_propagate(
 
 auto_buy_tab_wrap = ctk.CTkFrame(
     topbar,
-    width=145,
+    width=105,
     height=34,
     fg_color="transparent",
     corner_radius=0,
@@ -1628,7 +3586,7 @@ auto_buy_tab = ctk.CTkButton(
     auto_buy_tab_wrap,
     text="Mua phôi",
     command=show_auto_buy,
-    width=145,
+    width=105,
     height=29,
     fg_color="transparent",
     hover_color="#1B1F24",
@@ -1647,7 +3605,7 @@ auto_buy_indicator.pack(fill="x", padx=8, side="bottom")
 
 player_insert_tab_wrap = ctk.CTkFrame(
     topbar,
-    width=155,
+    width=115,
     height=34,
     fg_color="transparent",
     corner_radius=0,
@@ -1659,7 +3617,7 @@ player_insert_tab = ctk.CTkButton(
     player_insert_tab_wrap,
     text="Chèn cầu thủ",
     command=open_player_insert,
-    width=155,
+    width=115,
     height=29,
     fg_color="transparent",
     hover_color="#1B1F24",
@@ -1675,6 +3633,37 @@ player_insert_indicator = ctk.CTkFrame(
     corner_radius=0,
 )
 player_insert_indicator.pack(fill="x", padx=8, side="bottom")
+
+upgrade_tab_wrap = ctk.CTkFrame(
+    topbar,
+    width=110,
+    height=34,
+    fg_color="transparent",
+    corner_radius=0,
+)
+upgrade_tab_wrap.pack(side="left", padx=0, pady=7)
+upgrade_tab_wrap.pack_propagate(False)
+
+upgrade_tab = ctk.CTkButton(
+    upgrade_tab_wrap,
+    text="Đập cầu thủ",
+    command=open_upgrade,
+    width=110,
+    height=29,
+    fg_color="transparent",
+    hover_color="#1B1F24",
+    text_color=MUTED,
+    corner_radius=0,
+    border_width=0,
+)
+upgrade_tab.pack(fill="x")
+upgrade_indicator = ctk.CTkFrame(
+    upgrade_tab_wrap,
+    height=2,
+    fg_color="transparent",
+    corner_radius=0,
+)
+upgrade_indicator.pack(fill="x", padx=8, side="bottom")
 
 
 ready_badge = ctk.CTkFrame(

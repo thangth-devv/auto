@@ -52,7 +52,8 @@ POPUP_CLOSE_BEFORE_SELECTION_TIMEOUT = 1.0
 PRICE_DIALOG_TIMEOUT = 0.8
 BUY_POPUP_REGION = (180, 90, 1100, 660)
 MAX_PRICE_INCREASE_RATIO = 1.30
-GIF_CAPTURE_INTERVAL = 0.12
+GIF_CAPTURE_INTERVAL = 0.20
+POST_POPUP_CAPTURE_DURATION = 2.0
 POPUP_CLOSE_TIMEOUT = 10.0
 POPUP_CLOSE_STABLE_READS = 2
 GIF_DIR = os.path.join(
@@ -355,7 +356,13 @@ def _click_purchase_button(hwnd, stop_event, log_callback):
     if stop_event.is_set():
         return False
 
-    click_client(hwnd, BUY_PLAYER_X, BUY_PLAYER_Y, fast=True)
+    click_client(
+        hwnd,
+        BUY_PLAYER_X,
+        BUY_PLAYER_Y,
+        method="message",
+        fast=True,
+    )
     return True
 
 
@@ -372,7 +379,13 @@ def _click_max_price_row(
     if stop_event.is_set():
         return False
 
-    click_client(hwnd, MAX_PRICE_X, MAX_PRICE_Y, fast=True)
+    click_client(
+        hwnd,
+        MAX_PRICE_X,
+        MAX_PRICE_Y,
+        method="message",
+        fast=True,
+    )
     random_sleep(0.05, 0.08)
     clicked_screen = capture_fco(hwnd)
     debug_path = _save_max_price_click_debug(
@@ -456,6 +469,25 @@ def _wait_for_buy_popup_close(hwnd, stop_event, gif_frames):
     return False
 
 
+def _capture_after_popup_close(hwnd, stop_event, gif_frames):
+    """Keep recording the result after the purchase popup has disappeared."""
+    deadline = time.time() + POST_POPUP_CAPTURE_DURATION
+    while time.time() < deadline:
+        if stop_event.is_set():
+            return False
+        screen = capture_fco(hwnd)
+        gif_frames.append(
+            Image.fromarray(cv2.cvtColor(screen, cv2.COLOR_BGR2RGB))
+        )
+        remaining = deadline - time.time()
+        if remaining > 0:
+            random_sleep(
+                min(GIF_CAPTURE_INTERVAL, remaining),
+                min(GIF_CAPTURE_INTERVAL, remaining),
+            )
+    return True
+
+
 def _close_popup_before_selection(hwnd, stop_event):
     """Close a stale purchase popup before clicking a different player row."""
     key_press(hwnd, win32con.VK_ESCAPE)
@@ -483,7 +515,13 @@ def _select_player_row(hwnd, queue_row, position, stop_event, log_callback):
     log_callback(
         f"[Hàng {queue_row}] Đang chọn cầu thủ ở vị trí {position}."
     )
-    click_client(hwnd, PLAYER_ROW_X, row_y, fast=True)
+    click_client(
+        hwnd,
+        PLAYER_ROW_X,
+        row_y,
+        method="message",
+        fast=True,
+    )
 
     # Chờ danh sách cập nhật trạng thái chọn trước khi nút mua được xử lý.
     deadline = time.time() + PLAYER_SELECTION_WAIT
@@ -568,12 +606,23 @@ def _insert_one(
             f"[Hàng {queue_row}][Vị trí {position}] "
             f"Nhập số lượng theo tool: {quantity}."
         )
-        double_click_input(hwnd, QUANTITY_X, QUANTITY_Y)
+        double_click_input(
+            hwnd,
+            QUANTITY_X,
+            QUANTITY_Y,
+            method="message",
+        )
         random_sleep(0.03, 0.05)
         type_text(hwnd, str(quantity))
         _add_gif_frame(gif_frames, hwnd)
     random_sleep(0.02, 0.04)
-    click_client(hwnd, ORDER_BUY_X, ORDER_BUY_Y, fast=True)
+    click_client(
+        hwnd,
+        ORDER_BUY_X,
+        ORDER_BUY_Y,
+        method="message",
+        fast=True,
+    )
     _add_gif_frame(gif_frames, hwnd)
 
     popup_closed = _wait_for_buy_popup_close(hwnd, stop_event, gif_frames)
@@ -582,6 +631,9 @@ def _insert_one(
             f"[Hàng {queue_row}][Vị trí {position}] "
             "⚠️ Chưa xác nhận popup mua đã đóng; chưa phát thông báo."
         )
+        return previous_price, False, False
+
+    if not _capture_after_popup_close(hwnd, stop_event, gif_frames):
         return previous_price, False, False
 
     log_callback(
@@ -667,119 +719,134 @@ def run_player_insert(hwnd, entries, stop_event, log_callback):
         )
     )
 
-    for queue_row, entry in queue:
-        if stop_event.is_set():
-            break
+    completed_resets = {}
 
-        position = entry["position"]
-        reset_code = entry["reset"]
-        quantity = entry["quantity"]
-        # A popup left open from the previous game selection would intercept
-        # the row click and make the next price read use the wrong player.
-        if not _close_popup_before_selection(hwnd, stop_event):
-            log_callback(
-                f"[Hàng {queue_row}][Vị trí {position}] "
-                "⚠️ Không đóng được popup cũ trước khi chọn cầu thủ."
-            )
-            break
-        if not _select_player_row(
-            hwnd,
-            queue_row,
-            position,
-            stop_event,
-            log_callback,
-        ):
-            break
+    while not stop_event.is_set():
+        for queue_row, entry in queue:
+            if stop_event.is_set():
+                break
 
-        selected_price = None
-        prepared_reset = None
-        reset_started = None
-        waiting_reset_logged = None
-        selected_price = None
+            position = entry["position"]
+            reset_code = entry["reset"]
+            quantity = entry["quantity"]
+            # A popup left open from the previous game selection would intercept
+            # the row click and make the next price read use the wrong player.
+            if not _close_popup_before_selection(hwnd, stop_event):
+                log_callback(
+                    f"[Hàng {queue_row}][Vị trí {position}] "
+                    "⚠️ Không đóng được popup cũ trước khi chọn cầu thủ."
+                )
+                break
+            if not _select_player_row(
+                hwnd,
+                queue_row,
+                position,
+                stop_event,
+                log_callback,
+            ):
+                break
 
-        while not stop_event.is_set():
-            now = datetime.now()
-            reset_at = _nearest_reset_datetime(reset_code, now)
-            seconds_to_reset = (reset_at - now).total_seconds()
+            selected_price = None
+            prepared_reset = None
+            reset_started = None
+            waiting_reset_logged = None
 
-            in_window = reset_at <= now < reset_at + timedelta(minutes=20)
-            if in_window:
-                if prepared_reset != reset_at:
-                    log_callback(
-                        f"[Thứ tự {queue_row}][Vị trí {position}] "
-                        f"Reset {reset_code}: cập nhật giá ghi nhớ."
+            while not stop_event.is_set():
+                now = datetime.now()
+                reset_at = _nearest_reset_datetime(reset_code, now)
+
+                if completed_resets.get(queue_row) == reset_at:
+                    next_reset = _next_reset_datetime(
+                        reset_code,
+                        reset_at + timedelta(minutes=20),
                     )
-                    if not _select_player_row(
-                        hwnd, queue_row, position, stop_event, log_callback
-                    ):
+                    wait_seconds = min(
+                        max((next_reset - now).total_seconds(), 0.05),
+                        1.0,
+                    )
+                    interruptible_sleep(wait_seconds)
+                    continue
+
+                seconds_to_reset = (reset_at - now).total_seconds()
+                in_window = reset_at <= now < reset_at + timedelta(minutes=20)
+                if in_window:
+                    if prepared_reset != reset_at:
+                        log_callback(
+                            f"[Thứ tự {queue_row}][Vị trí {position}] "
+                            f"Reset {reset_code}: cập nhật giá ghi nhớ."
+                        )
+                        if not _select_player_row(
+                            hwnd, queue_row, position, stop_event, log_callback
+                        ):
+                            break
+                        selected_price = _check_initial_price(
+                            hwnd,
+                            queue_row,
+                            position,
+                            reset_code,
+                            stop_event,
+                            log_callback,
+                            already_selected=True,
+                        )
+                        prepared_reset = reset_at
+                        if selected_price is None:
+                            log_callback(
+                                f"[Thứ tự {queue_row}][Vị trí {position}] "
+                                "Không cập nhật được giá reset; bỏ qua reset này."
+                            )
+                            break
+
+                    if reset_started != reset_at:
+                        reset_started = reset_at
+                        log_callback(
+                            f"[Thứ tự {queue_row}][Vị trí {position}] "
+                            f"Bắt đầu kiểm tra reset {reset_code}."
+                        )
+                    if now >= reset_started + timedelta(minutes=20):
+                        log_callback(
+                            f"[Thứ tự {queue_row}][Vị trí {position}] "
+                            "Hết 20 phút không đổi; chuyển sang thứ tự kế tiếp."
+                        )
                         break
-                    selected_price = _check_initial_price(
+                    if now.second >= 15:
+                        interruptible_sleep(0.2)
+                        continue
+                    (
+                        selected_price,
+                        purchased,
+                        exhausted,
+                    ) = _insert_one(
                         hwnd,
                         queue_row,
                         position,
                         reset_code,
+                        quantity,
+                        selected_price,
                         stop_event,
                         log_callback,
-                        already_selected=True,
                     )
-                    prepared_reset = reset_at
-                    if selected_price is None:
+                    if purchased:
+                        completed_resets[queue_row] = reset_at
                         log_callback(
                             f"[Thứ tự {queue_row}][Vị trí {position}] "
-                            "Không cập nhật được giá reset; bỏ qua reset này."
+                            "✅ Chèn cầu thủ thành công; tiếp tục chạy đến reset kế tiếp."
                         )
+                        play_notification(log_callback)
                         break
-
-                if reset_started != reset_at:
-                    reset_started = reset_at
-                    log_callback(
-                        f"[Thứ tự {queue_row}][Vị trí {position}] "
-                        f"Bắt đầu kiểm tra reset {reset_code}."
-                    )
-                if now >= reset_started + timedelta(minutes=20):
-                    log_callback(
-                        f"[Thứ tự {queue_row}][Vị trí {position}] "
-                        "Hết 20 phút không đổi; chuyển sang thứ tự kế tiếp."
-                    )
-                    break
-                if now.second >= 15:
-                    interruptible_sleep(0.2)
+                    if exhausted:
+                        break
+                else:
+                    next_reset = _next_reset_datetime(reset_code, now)
+                    if waiting_reset_logged != next_reset:
+                        log_callback(
+                            f"[Thứ tự {queue_row}][Vị trí {position}] "
+                            f"Đang chờ reset lúc {next_reset:%d/%m %H:%M}."
+                        )
+                        waiting_reset_logged = next_reset
+                    wait_seconds = min(max(seconds_to_reset, 0.05), 1.0)
+                    interruptible_sleep(wait_seconds)
                     continue
-                (
-                    selected_price,
-                    purchased,
-                    exhausted,
-                ) = _insert_one(
-                    hwnd,
-                    queue_row,
-                    position,
-                    reset_code,
-                    quantity,
-                    selected_price,
-                    stop_event,
-                    log_callback,
-                )
-                if purchased:
-                    log_callback(
-                        f"[Thứ tự {queue_row}][Vị trí {position}] "
-                        "✅ Chèn cầu thủ thành công, phát âm thanh thông báo."
-                    )
-                    play_notification(log_callback)
-                    break
-                if exhausted:
-                    break
-            else:
-                next_reset = _next_reset_datetime(reset_code, now)
-                if waiting_reset_logged != next_reset:
-                    log_callback(
-                        f"[Thứ tự {queue_row}][Vị trí {position}] "
-                        f"Đang chờ reset lúc {next_reset:%d/%m %H:%M}."
-                    )
-                    waiting_reset_logged = next_reset
-                wait_seconds = min(max(seconds_to_reset, 0.05), 1.0)
-                interruptible_sleep(wait_seconds)
-                continue
 
-            interruptible_sleep(0.01)
+                interruptible_sleep(0.01)
 
     log_callback("⛔ Player Insert đã dừng.")
