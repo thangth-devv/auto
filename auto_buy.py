@@ -4,6 +4,7 @@ import re
 import os
 import ctypes
 import sys
+import threading
 import cv2
 import numpy as np
 from PIL import ImageGrab
@@ -12,7 +13,7 @@ import win32con
 import win32api
 
 
-_active_stop_event = None
+_active_stop_state = threading.local()
 
 
 def resource_path(relative_path):
@@ -49,11 +50,22 @@ pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH
 
 def interruptible_sleep(seconds):
     """Wait briefly, but wake up immediately when Stop is requested."""
-    if _active_stop_event is not None:
-        return _active_stop_event.wait(seconds)
+    stop_event = getattr(_active_stop_state, "event", None)
+    if stop_event is not None:
+        return stop_event.wait(seconds)
 
     time.sleep(seconds)
     return False
+
+
+def _stop_requested(stop_event):
+    return stop_event is not None and stop_event.is_set()
+
+
+def _wait_or_stop(seconds, stop_event=None):
+    if stop_event is not None:
+        return stop_event.wait(seconds)
+    return interruptible_sleep(seconds)
 
 
 def random_sleep(min_seconds, max_seconds):
@@ -138,19 +150,22 @@ def capture_fco(hwnd):
     return screen
 
 
-def wait_for_valid_window(hwnd, timeout=10):
+def wait_for_valid_window(hwnd, timeout=10, stop_event=None):
     deadline = time.time() + timeout
 
     while time.time() < deadline:
+        if _stop_requested(stop_event):
+            return False
         if not win32gui.IsWindow(hwnd):
             raise RuntimeError("Cửa sổ FC ONLINE không còn tồn tại.")
 
         left, top, right, bottom = win32gui.GetWindowRect(hwnd)
 
         if right > left and bottom > top:
-            return
+            return True
 
-        interruptible_sleep(0.2)
+        if _wait_or_stop(0.2, stop_event):
+            return False
 
     raise RuntimeError(
         "Cửa sổ FC ONLINE chưa sẵn sàng (kích thước 0x0)."
@@ -446,21 +461,14 @@ def _key_lparam(vk, key_up=False):
     return ctypes.c_long(value).value
 
 
-def key_press(hwnd, vk, char=None):
+def key_press(hwnd, vk, char=None, stop_event=None):
     """
     Gửi phím với scan-code/lParam đầy đủ.
     Quan trọng với FC Online vì chỉ truyền VK + lParam=0
     có thể khiến Delete/Page Down bị game bỏ qua.
     """
-    down_lparam = _key_lparam(
-        vk,
-        key_up=False
-    )
-
-    up_lparam = _key_lparam(
-        vk,
-        key_up=True
-    )
+    if _stop_requested(stop_event):
+        return False
 
     activate_window(hwnd)
     win32api.keybd_event(
@@ -469,13 +477,14 @@ def key_press(hwnd, vk, char=None):
         0,
         0,
     )
-    random_sleep(0.03, 0.05)
+    _wait_or_stop(0.03, stop_event)
     win32api.keybd_event(
         vk,
         win32api.MapVirtualKey(vk, 0),
         win32con.KEYEVENTF_KEYUP,
         0,
     )
+    return not _stop_requested(stop_event)
 
 
 def key_release(hwnd, vk):
@@ -488,8 +497,10 @@ def key_release(hwnd, vk):
     )
 
 
-def select_all_input(hwnd):
+def select_all_input(hwnd, stop_event=None):
     """Chọn toàn bộ nội dung của ô đang được focus."""
+    if _stop_requested(stop_event):
+        return False
     activate_window(hwnd)
     win32api.keybd_event(
         win32con.VK_CONTROL,
@@ -497,7 +508,15 @@ def select_all_input(hwnd):
         0,
         0,
     )
-    random_sleep(0.03, 0.05)
+    stopped = _wait_or_stop(0.03, stop_event)
+    if stopped:
+        win32api.keybd_event(
+            win32con.VK_CONTROL,
+            win32api.MapVirtualKey(win32con.VK_CONTROL, 0),
+            win32con.KEYEVENTF_KEYUP,
+            0,
+        )
+        return False
     win32api.keybd_event(
         ord("A"),
         win32api.MapVirtualKey(ord("A"), 0),
@@ -516,30 +535,40 @@ def select_all_input(hwnd):
         win32con.KEYEVENTF_KEYUP,
         0,
     )
+    return not _stop_requested(stop_event)
 
 
-def clear_input(hwnd):
+def clear_input(hwnd, stop_event=None):
     """Chọn toàn bộ rồi xóa, lặp lại để tránh game bỏ sót phím nền."""
     for _ in range(2):
-        select_all_input(hwnd)
-        key_press(hwnd, win32con.VK_DELETE)
-        key_press(hwnd, win32con.VK_BACK)
-        random_sleep(0.06, 0.10)
+        if not select_all_input(hwnd, stop_event):
+            return False
+        if not key_press(hwnd, win32con.VK_DELETE, stop_event=stop_event):
+            return False
+        if not key_press(hwnd, win32con.VK_BACK, stop_event=stop_event):
+            return False
+        if _wait_or_stop(0.06, stop_event):
+            return False
+    return True
 
 
-def type_text(hwnd, text):
+def type_text(hwnd, text, stop_event=None):
     """Nhập chuỗi ký tự vào ô đang focus."""
     for char in str(text):
+        if _stop_requested(stop_event):
+            return False
         if char.isdigit():
-            key_press(hwnd, ord(char), char)
+            sent = key_press(hwnd, ord(char), char, stop_event)
         elif char == ".":
-            key_press(hwnd, 0xBE, char)
+            sent = key_press(hwnd, 0xBE, char, stop_event)
         elif char == ",":
-            key_press(hwnd, 0xBC, char)
+            sent = key_press(hwnd, 0xBC, char, stop_event)
         else:
-            key_press(hwnd, ord(char.upper()), char)
+            sent = key_press(hwnd, ord(char.upper()), char, stop_event)
 
-        random_sleep(0.02, 0.035)
+        if not sent or _wait_or_stop(0.02, stop_event):
+            return False
+    return True
 
 
 # Tọa độ theo ảnh FC Online 1280x752 hiện tại.
@@ -584,10 +613,18 @@ def image_to_client(hwnd, image_x, image_y):
     )
 
 
-def double_click_input(hwnd, image_x, image_y, method="message"):
+def double_click_input(
+    hwnd,
+    image_x,
+    image_y,
+    method="message",
+    stop_event=None,
+):
     """
     Double-click vào ô nhập bằng message hoặc input thật.
     """
+    if _stop_requested(stop_event):
+        return False
     client_x, client_y = image_to_client(hwnd, image_x, image_y)
     lparam = win32api.MAKELONG(int(client_x), int(client_y))
     win32gui.SendMessage(hwnd, win32con.WM_MOUSEMOVE, 0, lparam)
@@ -598,7 +635,10 @@ def double_click_input(hwnd, image_x, image_y, method="message"):
         lparam,
     )
     win32gui.SendMessage(hwnd, win32con.WM_LBUTTONUP, 0, lparam)
-    time.sleep(0.06)
+    if _wait_or_stop(0.06, stop_event):
+        return False
+    if _stop_requested(stop_event):
+        return False
     win32gui.SendMessage(
         hwnd,
         win32con.WM_LBUTTONDBLCLK,
@@ -606,6 +646,7 @@ def double_click_input(hwnd, image_x, image_y, method="message"):
         lparam,
     )
     win32gui.SendMessage(hwnd, win32con.WM_LBUTTONUP, 0, lparam)
+    return not _stop_requested(stop_event)
 
 
 def set_filter_by_double_click(
@@ -617,6 +658,7 @@ def set_filter_by_double_click(
     log_callback=None,
     clear_before_input=False,
     mouse_method="message",
+    stop_event=None,
 ):
     """
     Click đúp vào ô -> nhập giá trị -> Enter.
@@ -627,46 +669,48 @@ def set_filter_by_double_click(
         log_callback
     )
 
-    double_click_input(
+    if not double_click_input(
         hwnd,
         image_x,
         image_y,
         method=mouse_method,
-    )
+        stop_event=stop_event,
+    ):
+        return False
 
-    random_sleep(
-        0.08,
-        0.12
-    )
+    if _wait_or_stop(0.08, stop_event):
+        return False
 
     if clear_before_input:
-        clear_input(hwnd)
+        if not clear_input(hwnd, stop_event):
+            return False
 
     log_message(
         f"    ⌨️ Nhập '{value}' vào '{label}'...",
         log_callback
     )
 
-    type_text(
+    if not type_text(
         hwnd,
-        str(value)
-    )
+        str(value),
+        stop_event,
+    ):
+        return False
 
-    random_sleep(
-        0.05,
-        0.08
-    )
+    if _wait_or_stop(0.05, stop_event):
+        return False
 
-    key_press(
+    if not key_press(
         hwnd,
         win32con.VK_RETURN,
-        "\r"
-    )
+        "\r",
+        stop_event,
+    ):
+        return False
 
-    random_sleep(
-        0.10,
-        0.15
-    )
+    if _wait_or_stop(0.10, stop_event):
+        return False
+    return True
 
 
 def normalize_numeric_text(value):
@@ -703,12 +747,15 @@ def read_filter_value(
     image_x,
     image_y,
     expected=None,
-    roi_half_width=42
+    roi_half_width=42,
+    stop_event=None,
 ):
     """Đọc giá trị đang hiển thị trong ô lọc bằng OCR."""
     candidates = []
 
     for _ in range(5):
+        if _stop_requested(stop_event):
+            return ""
         screen = capture_fco(hwnd)
         screen_height, screen_width = screen.shape[:2]
 
@@ -741,6 +788,8 @@ def read_filter_value(
         ]
 
         for image in images:
+            if _stop_requested(stop_event):
+                return ""
             text = pytesseract.image_to_string(
                 image,
                 config="--psm 7 -c tessedit_char_whitelist=0123456789",
@@ -752,7 +801,8 @@ def read_filter_value(
                     return value
                 candidates.append(value)
 
-        random_sleep(0.03, 0.05)
+        if _wait_or_stop(0.03, stop_event):
+            return ""
 
     if not candidates:
         return ""
@@ -775,6 +825,7 @@ def set_filter_with_verification(
     verification_roi_half_width=42,
     clear_before_input=False,
     mouse_method="message",
+    stop_event=None,
 ):
     """Nhập một ô lọc và xác minh lại giá trị bằng OCR."""
     expected_value = (
@@ -788,7 +839,9 @@ def set_filter_with_verification(
     )
 
     for attempt in range(1, max_attempts + 1):
-        set_filter_by_double_click(
+        if _stop_requested(stop_event):
+            return False
+        if not set_filter_by_double_click(
             hwnd,
             image_x,
             image_y,
@@ -797,22 +850,27 @@ def set_filter_with_verification(
             log_callback,
             clear_before_input=clear_before_input,
             mouse_method=mouse_method,
-        )
+            stop_event=stop_event,
+        ):
+            return False
 
         actual = read_filter_value(
             hwnd,
             image_x,
             image_y,
             expected=expected,
-            roi_half_width=verification_roi_half_width
+            roi_half_width=verification_roi_half_width,
+            stop_event=stop_event,
         )
+        if _stop_requested(stop_event):
+            return False
 
         if numeric_match(actual, expected):
             log_message(
                 f"    ✅ Đã xác minh '{label}': {actual}",
                 log_callback
             )
-            return
+            return True
 
         # OCR không đọc được thì không được kết luận ô nhập sai.
         # Giá trị đã được nhập và Enter; tiếp tục tránh dừng bot oan.
@@ -822,7 +880,7 @@ def set_filter_with_verification(
                 "giữ giá trị vừa nhập.",
                 log_callback
             )
-            return
+            return True
 
         # Xác nhận lại một lần trước khi nhập lại để tránh OCR đọc nhầm.
         confirmed_actual = read_filter_value(
@@ -830,15 +888,18 @@ def set_filter_with_verification(
             image_x,
             image_y,
             expected=actual,
-            roi_half_width=verification_roi_half_width
+            roi_half_width=verification_roi_half_width,
+            stop_event=stop_event,
         )
+        if _stop_requested(stop_event):
+            return False
         if not numeric_match(confirmed_actual, actual):
             log_message(
                 f"    ⚠️ OCR chưa ổn định cho '{label}'; "
                 "giữ giá trị vừa nhập.",
                 log_callback
             )
-            return
+            return True
 
         log_message(
             f"    ⚠️ '{label}' chưa đúng "
@@ -861,6 +922,7 @@ def set_purchase_filters(
     quantity,
     log_callback=None,
     mouse_method="message",
+    stop_event=None,
 ):
     """
     Flow:
@@ -874,19 +936,27 @@ def set_purchase_filters(
         "⚙️ Đang thiết lập bộ lọc mua hàng...",
         log_callback
     )
+    if _stop_requested(stop_event):
+        return False
 
     current_min = read_filter_value(
         hwnd,
         STAT_MIN_X,
         STAT_MIN_Y,
-        roi_half_width=42
+        roi_half_width=42,
+        stop_event=stop_event,
     )
+    if _stop_requested(stop_event):
+        return False
     current_max = read_filter_value(
         hwnd,
         STAT_MAX_X,
         STAT_MAX_Y,
-        roi_half_width=42
+        roi_half_width=42,
+        stop_event=stop_event,
     )
+    if _stop_requested(stop_event):
+        return False
 
     if current_min.isdigit() and current_max.isdigit():
         current_min_value = int(current_min)
@@ -929,8 +999,10 @@ def set_purchase_filters(
     }
 
     for filter_name in filter_order:
+        if _stop_requested(stop_event):
+            return False
         image_x, image_y, value, label = filter_configs[filter_name]
-        set_filter_with_verification(
+        if not set_filter_with_verification(
             hwnd,
             image_x,
             image_y,
@@ -939,11 +1011,13 @@ def set_purchase_filters(
             log_callback,
             clear_before_input=True,
             mouse_method=mouse_method,
-        )
+            stop_event=stop_event,
+        ):
+            return False
 
     # 3. Giá tối đa mỗi thẻ. The configured value is entered directly into
     # the game's price field without an additional unit conversion.
-    set_filter_with_verification(
+    if not set_filter_with_verification(
         hwnd,
         MAX_CARD_PRICE_X,
         MAX_CARD_PRICE_Y,
@@ -953,10 +1027,12 @@ def set_purchase_filters(
         verification_value=max_card_price * 10000,
         verification_roi_half_width=140,
         mouse_method=mouse_method,
-    )
+        stop_event=stop_event,
+    ):
+        return False
 
     # 4. Số lượng mỗi lần mua - KHÔNG nằm trong profile.
-    set_filter_with_verification(
+    if not set_filter_with_verification(
         hwnd,
         QUANTITY_X,
         QUANTITY_Y,
@@ -964,8 +1040,12 @@ def set_purchase_filters(
         "Số lượng",
         log_callback,
         mouse_method=mouse_method,
-    )
+        stop_event=stop_event,
+    ):
+        return False
 
+    if _stop_requested(stop_event):
+        return False
     log_message(
         f"✅ Đã điền filter: MIN={stat_min} | "
         f"MAX={stat_max} | "
@@ -973,6 +1053,7 @@ def set_purchase_filters(
         f"Số lượng={quantity}",
         log_callback
     )
+    return True
 
 # ============================================================
 # FAILURE CONFIRM BUTTON
@@ -1487,7 +1568,12 @@ def click_until_disappear(
 COUNT_ROI = (480, 535, 950, 660)
 
 
-def read_purchase_count(hwnd, log_callback=None, retries=2):
+def read_purchase_count(
+    hwnd,
+    log_callback=None,
+    retries=2,
+    stop_event=None,
+):
     """
     Đọc số X trong câu:
         "Bạn đã mua được tổng cộng X cầu thủ"
@@ -1499,6 +1585,8 @@ def read_purchase_count(hwnd, log_callback=None, retries=2):
     left, top, right, bottom = COUNT_ROI
 
     for attempt in range(1, retries + 1):
+        if _stop_requested(stop_event):
+            return None
 
         try:
             screen = capture_fco(hwnd)
@@ -1548,6 +1636,8 @@ def read_purchase_count(hwnd, log_callback=None, retries=2):
             ]
 
             for image_name, image, config in images:
+                if _stop_requested(stop_event):
+                    return None
 
                 text = pytesseract.image_to_string(
                     image,
@@ -1609,6 +1699,8 @@ def read_purchase_count(hwnd, log_callback=None, retries=2):
                         )
 
                     return 1
+                if _stop_requested(stop_event):
+                    return None
 
             if log_callback:
                 log_callback(
@@ -1623,7 +1715,8 @@ def read_purchase_count(hwnd, log_callback=None, retries=2):
                     f"⚠️ OCR lỗi lần {attempt}/{retries}: {exc}"
                 )
 
-        random_sleep(0.08, 0.12)
+        if _wait_or_stop(0.08, stop_event):
+            return None
 
     if log_callback:
         log_callback(
@@ -1711,9 +1804,7 @@ def run_auto_buy(
     notify_on_complete=True,
     mouse_method="message",
 ):
-    global _active_stop_event
-
-    _active_stop_event = stop_event
+    _active_stop_state.event = stop_event
 
 
     # ========================================================
@@ -1729,6 +1820,8 @@ def run_auto_buy(
 
         return
 
+    if _stop_requested(stop_event):
+        return
 
     # ========================================================
     # LOAD TEMPLATES
@@ -1812,9 +1905,11 @@ def run_auto_buy(
     # ========================================================
 
     try:
-        wait_for_valid_window(hwnd)
+        if not wait_for_valid_window(hwnd, stop_event=stop_event):
+            log_message("⛔ Đã dừng khi chờ cửa sổ FC ONLINE.", log_callback)
+            return
 
-        set_purchase_filters(
+        filters_set = set_purchase_filters(
             hwnd,
             stat_min,
             stat_max,
@@ -1822,8 +1917,15 @@ def run_auto_buy(
             quantity,
             log_callback=log_callback,
             mouse_method=mouse_method,
+            stop_event=stop_event,
         )
+        if not filters_set or _stop_requested(stop_event):
+            log_message("⛔ Đã dừng khi thiết lập bộ lọc mua phôi.", log_callback)
+            return
     except Exception as exc:
+        if _stop_requested(stop_event):
+            log_message("⛔ Đã dừng khi thiết lập bộ lọc mua phôi.", log_callback)
+            return
         log_message(
             f"❌ Không thể thiết lập bộ lọc mua hàng: {exc}",
             log_callback
@@ -1972,6 +2074,8 @@ def run_auto_buy(
             log_callback
         )
 
+        if _stop_requested(stop_event):
+            break
 
         click_client(
             hwnd,
@@ -2068,6 +2172,8 @@ def run_auto_buy(
             log_callback
         )
 
+        if _stop_requested(stop_event):
+            break
 
         click_client(
             hwnd,
@@ -2363,6 +2469,8 @@ def run_auto_buy(
                 log_callback
             )
 
+            if _stop_requested(stop_event):
+                break
 
             receive_clicked = click_until_disappear(
                 hwnd,
@@ -2481,8 +2589,11 @@ def run_auto_buy(
             round_count = read_purchase_count(
                 hwnd,
                 log_callback=log_callback,
-                retries=3
+                retries=3,
+                stop_event=stop_event,
             )
+            if _stop_requested(stop_event):
+                break
 
             log_message(
                 f"📦 Round này mua được: {round_count} cầu thủ",

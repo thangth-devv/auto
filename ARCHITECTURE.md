@@ -1,5 +1,7 @@
 # AUTO FCO - Kiến trúc hệ thống
 
+python -m PyInstaller --noconfirm --clean --onefile --windowed --uac-admin --name AutoFCO --icon icon.png --add-data "templates;templates" --add-data "tesseract;tesseract" --add-data "notify.mp3;." --add-data "icon.png;." --add-data "profiles.json;." app.py
+
 ## 1. Mục tiêu
 
 AUTO FCO là ứng dụng tự động hóa tương tác với FC Online bằng Windows automation, bao gồm hai luồng chính:
@@ -13,8 +15,10 @@ Mục tiêu chung của hệ thống là:
 - Tương tác với UI bằng tọa độ và template matching thay vì giả lập chuột rời rạc.
 - Chia rõ UI thread và worker thread để không block giao diện.
 - Dùng OCR và hình ảnh để xác định trạng thái popup và giá tối đa.
-- Nhận diện cấp thẻ bằng template `templates/card_level_1.png` đến
-  `templates/card_level_13.png`, không dùng OCR cho chữ số cấp thẻ.
+- Nhận diện cấp thẻ sở hữu bằng OCR trên badge ở góc dưới bên trái thẻ cầu thủ;
+  không dùng template matching để quyết định cấp thẻ sở hữu.
+- Luồng Đập cầu thủ (upgrade) chỉ lọc phôi theo OVR (MIN/MAX);
+  không check cấp thẻ khi chọn phôi.
 - Có cơ chế dừng an toàn (`stop_event`) khi cần ngắt hoạt động.
 
 ## 2. Cấu trúc thư mục
@@ -110,6 +114,9 @@ Trách nhiệm:
   và không chiếm con trỏ người dùng. Các thao tác của chính quy trình Upgrade
   (chọn cầu thủ, đổi tab, bấm Tiếp/Nâng cấp) cũng đi qua `_upgrade_click`.
 - `interruptible_sleep` / `random_sleep`: ngủ an toàn, có thể được dừng ngay khi `stop_event` được set.
+- `run_auto_buy` truyền `stop_event` xuyên suốt bước thiết lập/xác minh filter
+  và vòng mua phôi. Event lưu theo thread để các lần Auto Buy đồng thời không
+  ghi đè tín hiệu dừng của nhau.
 - `play_notification`: phát âm thanh khi mua thành công hoặc cảnh báo.
 
 Cấu hình và template chính:
@@ -240,7 +247,7 @@ START
   v
 SORT_QUEUE
   |
-  
+
 SELECT_CURRENT_PLAYER
   |
   v
@@ -292,6 +299,50 @@ reset_base_price = current_price đọc được ở đầu cửa sổ reset
 
 Trong suốt reset đó, `reset_base_price` không đổi. Khi reset mới bắt đầu, mới thay giá mốc mới. Đây là chiến lược chính để tránh mua nhầm do giá đang cao hoặc đã tăng lên rồi lại giảm.
 
+## 6.5 Luồng Đập cầu thủ (Upgrade)
+
+Ngoài Auto Buy và Player Insert, `app.py` còn có luồng Đập cầu thủ
+(`open_upgrade`) dùng để nâng cấp thẻ cầu thủ lên mức mục tiêu
+(`target_level`, ví dụ +5).
+
+Thiết kế lọc phôi:
+
+- Luồng chỉ kiểm tra OVR của từng dòng phôi thuộc phạm vi
+  `stat_min` - `stat_max` do người dùng nhập.
+- KHÔNG check cấp thẻ khi chọn phôi: hàm `_select_player_in_stat_range`
+  không còn tham số `allowed_card_levels` và không đọc badge cấp thẻ
+  (`_read_player_card_level`) khi quét danh sách.
+- UI không còn khối "MỨC THẺ ĐẬP (CHỌN NHIỀU)"; profile `upgrade`
+  trong `profiles.json` chỉ còn `stat_min`, `stat_max`, `target_level`,
+  `purchase_quantity`, `purchase_price`.
+- Nút START bị disable trong suốt thời gian worker Upgrade chạy và được bật
+  lại khi worker kết thúc, kể cả khi dừng do STOP hoặc lỗi.
+- Ngay sau START, tool đọc cấp thẻ hiện tại trên badge của cầu thủ đang chọn.
+  Nếu OCR không đọc được thì dừng an toàn; nếu cấp hiện tại đã đạt/vượt mục tiêu
+  thì dừng mà không bắt đầu đập.
+- Đọc kết quả sau khi quay lại danh sách vẫn dùng `_read_owned_card_level` để
+  so với `target_level` và quyết định dừng hay đập tiếp nếu OCR đọc được. Nếu
+  OCR không đọc được, luồng tiếp tục chọn phôi; việc bấm Tiếp chỉ dựa vào trạng
+  thái hiển thị của nút Tiếp. Cấp thẻ đạt hoặc vượt mục tiêu thì dừng tool.
+- Khi thiếu phôi, Upgrade gọi `run_auto_buy` với cùng `upgrade_stop_event`;
+  STOP hủy các bước chờ, nhập/xác minh filter và ngăn click mua/xác nhận tiếp
+  theo. Sau khi dừng mua, Upgrade không quay lại quy trình đập.
+
+Mỗi vòng đập (`run_upgrade_cycle`):
+
+1. Ngay sau khi nhấn START, đọc cấp thẻ badge hiện tại; nếu không đọc được thì
+   dừng an toàn, nếu đã đạt/vượt `target_level` thì dừng và không đập tiếp.
+2. Sắp xếp danh sách OVR tăng dần (`_sort_ovr_ascending`).
+3. Chọn phôi có OVR trong phạm vi MIN/MAX (bỏ qua cấp thẻ).
+4. Nếu thiếu phôi => chuyển tab Mua hàng loạt, mua bằng `run_auto_buy`
+   rồi quay lại tab Cầu thủ đang sở hữu.
+5. Bấm Tiếp => Nâng cấp => Bỏ qua (Space); chờ nút Tiếp màu xanh ổn định rồi
+   bấm một lần. Sau đó kiểm tra lại nút: nếu vẫn hiện ổn định thì bấm thêm một
+   lần; nếu nút biến mất thì tiếp tục đọc mức thẻ ở danh sách cầu thủ. Nếu nút
+   vẫn còn sau hai lần bấm thì dừng để tránh thao tác lên màn hình chưa xác nhận.
+   Không dùng OCR cấp thẻ trên màn hình kết quả để quyết định số lần bấm Tiếp.
+6. Nếu đạt/vượt `target_level` => dừng; ngược lại lặp lại từ bước 2.
+
 ## 7. OCR và template matching
 
 ### 7.1 Template matching
@@ -307,7 +358,21 @@ Trong suốt reset đó, `reset_base_price` không đổi. Khi reset mới bắt
 
 Mục đích là tìm đúng đối tượng UI dù kích thước hay vị trí thay đổi theo window state.
 
-### 7.2 OCR cho giá
+### 7.2 OCR
+
+OCR được dùng để đọc giá, số lượng cầu thủ trong popup mua và cấp thẻ sở hữu.
+Detector cấp thẻ chỉ đọc badge ở góc dưới bên trái thẻ cầu thủ đang chọn:
+
+```python
+OWNED_CARD_LEVEL_ROI = (196, 257, 231, 281)
+```
+
+ROI tính theo layout tham chiếu `1280x752` và được scale theo ảnh chụp cửa sổ.
+Ảnh được chuyển xám, threshold, phóng to và padding trước khi thử nhiều PSM
+Tesseract; chấp nhận kết quả khi ít nhất hai lần đọc đồng thuận trong khoảng
+cấp hợp lệ.
+
+### 7.3 OCR cho giá
 
 `player_insert.py` dùng ROI cố định theo layout chuẩn 1280x752 để đọc dòng `Giá tối đa`:
 
@@ -343,6 +408,11 @@ Khi cần kiểm tra, `player_insert.py` lưu hình ảnh vào:
 
 Cơ chế này rất có ích để gỡ lỗi khi OCR sai hoặc layout bị lệch.
 
+Khi luồng Upgrade bắt đầu đọc cấp thẻ sau màn hình kết quả hoặc sau START,
+`app.py` lưu một ảnh toàn màn hình có khoanh đỏ vùng `OWNED_CARD_LEVEL_ROI`
+và ảnh crop tương ứng trong `ocr_debug/`. Log hiển thị tọa độ chuẩn, tọa độ
+pixel theo kích thước ảnh, và đường dẫn hai ảnh này.
+
 ## 9. Threading và an toàn
 
 ### 9.1 Main thread
@@ -368,7 +438,8 @@ Worker thread thực hiện phần automation nặng:
 
 ### 9.3 Dừng an toàn
 
-`stop_event` là cơ chế chung của cả Auto Buy và Player Insert. Mọi vòng chờ và logic click đều phải kiểm tra:
+`stop_event` là cơ chế dừng của Auto Buy, Player Insert và Upgrade. Mọi vòng
+chờ, bước nhập filter, và logic click đều phải kiểm tra:
 
 ```python
 stop_event.is_set()
@@ -381,6 +452,13 @@ set stop_event
 worker thoát tại điểm an toàn
 không tiếp tục click / nhập / OCR
 ```
+
+Trong lúc Upgrade mua phôi, event được truyền xuống `run_auto_buy`, bao gồm
+bước chờ cửa sổ, đọc/nhập/xác minh filter và vòng xử lý popup mua. Khi nhận
+STOP, worker bỏ qua các bước tiếp theo và không bắt đầu click mua hoặc xác
+nhận mới; một thao tác capture/OCR hoặc lệnh Windows đang thực thi có thể hoàn
+tất trước khi worker thoát. Các khoảng chờ dùng event để thức dậy ngay khi
+STOP được set.
 
 ## 10. Error handling
 
@@ -463,18 +541,19 @@ ocr_debug/
 - [ ] Khi giá không đổi, bot nhấn `ESC` và không mua.
 - [ ] Khi giá đổi, bot click đúng dòng giá tối đa và mua đúng số lượng.
 - [ ] GIF được lưu chỉ với lần mua có giá thay đổi.
-- [ ] Cấp thẻ trong danh sách được nhận diện bằng đúng một template trong
-      `templates/card_level_1.png` đến `templates/card_level_13.png`.
-- [ ] Matcher cấp thẻ ưu tiên độ khớp toàn bộ badge và chỉ dùng vùng chữ số
-      làm điểm phụ, tránh nhận `+6` thành `+1` do nền giống nhau.
-- [ ] Khi đọc cột `Thẻ`, detector quét từ vị trí dòng xuống tối đa 14 pixel
-      để bao phủ badge bị lệch dọc.
-- [ ] Khi thiếu hoặc không đọc được template cấp thẻ, luồng báo lỗi rõ ràng
-      thay vì tự suy đoán cấp thẻ.
+- [ ] Cấp thẻ sở hữu được OCR tại badge góc dưới trái của thẻ được chọn.
+- [ ] Khi START, cấp thẻ ban đầu được đọc trước lần đập đầu; OCR lỗi thì dừng
+      an toàn, cấp đã đạt/vượt mục tiêu thì không đập tiếp.
+- [ ] Khi đọc cấp thẻ, ảnh debug khoanh đúng ROI badge và lưu crop tương ứng.
 - [ ] Nút `Tiếp` được phát hiện ổn định dù vị trí contour dao động nhẹ giữa
       các frame animation.
 - [ ] Sau khi bấm `Tiếp theo`, nếu popup xác nhận nâng cấp xuất hiện thì
       tool tick tùy chọn không hiển thị lại trong lần đăng nhập này và bấm
       `Tiến hành`; nếu popup không xuất hiện thì tiếp tục bình thường.
-- [ ] `STOP` dừng được worker mà không click tiếp.
+- [ ] Đập cầu thủ chỉ chọn phôi theo OVR MIN/MAX, không lọc theo cấp thẻ.
+- [ ] Luồng đập dừng khi mức thẻ đạt/vượt `target_level`.
+- [ ] START bị disable khi worker Upgrade đang chạy và bật lại sau khi worker
+      thoát do STOP, lỗi hoặc hoàn tất.
+- [ ] `STOP` trong lúc mua phôi dừng các bước nhập filter/chờ popup và không
+      phát sinh click mua hoặc xác nhận tiếp theo.
 - [ ] OCR debug và log hiển thị rõ ràng khi lỗi xảy ra.
