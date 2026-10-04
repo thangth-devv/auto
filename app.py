@@ -10,6 +10,9 @@ import json
 import re
 import unicodedata
 import hashlib
+import subprocess
+import urllib.error
+import urllib.request
 from collections import Counter
 from tkinter import messagebox
 
@@ -37,6 +40,10 @@ ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("green")
 
 APP_TITLE = "AUTO FCO"
+APP_VERSION = "1.0.1"
+GITHUB_RELEASES_API = (
+    "https://api.github.com/repos/thangth-devv/auto/releases/latest"
+)
 APP_WIDTH = 460
 APP_HEIGHT = 660
 
@@ -106,6 +113,8 @@ player_insert_layout = None
 upgrade_window = None
 upgrade_layout = None
 upgrade_stop_event = None
+upgrade_is_running = False
+update_installing = False
 
 
 def _upgrade_stop_requested():
@@ -142,7 +151,15 @@ def resource_path(relative_path):
     )
 
 
-PROFILE_FILE = resource_path("profiles.json")
+def _user_data_directory():
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    if not local_app_data:
+        local_app_data = os.path.expanduser("~")
+    return os.path.join(local_app_data, "AutoFCO")
+
+
+PROFILE_FILE = os.path.join(_user_data_directory(), "profiles.json")
+BUNDLED_PROFILE_FILE = resource_path("profiles.json")
 profiles = {}
 
 ICON_PATH = resource_path("icon.png")
@@ -494,9 +511,14 @@ def load_profiles():
     global profiles
 
     try:
-        if os.path.exists(PROFILE_FILE):
+        profile_source = (
+            PROFILE_FILE
+            if os.path.exists(PROFILE_FILE)
+            else BUNDLED_PROFILE_FILE
+        )
+        if os.path.exists(profile_source):
             with open(
-                PROFILE_FILE,
+                profile_source,
                 "r",
                 encoding="utf-8"
             ) as f:
@@ -515,6 +537,10 @@ def load_profiles():
 
 def save_profiles():
     try:
+        os.makedirs(
+            os.path.dirname(PROFILE_FILE),
+            exist_ok=True
+        )
         with open(
             PROFILE_FILE,
             "w",
@@ -534,6 +560,267 @@ def save_profiles():
             f"❌ Không lưu được profile: {exc}"
         )
         return False
+
+
+def _release_version(tag_name):
+        match = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)", tag_name.strip())
+        if not match:
+            raise ValueError(
+                f"Tag version không hợp lệ (cần dạng vX.Y.Z): {tag_name}"
+            )
+        return tuple(int(part) for part in match.groups())
+
+
+def _github_json(url):
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "AutoFCO-Updater",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+    )
+    with urllib.request.urlopen(request, timeout=15) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def _download_release_asset(asset, destination):
+    request = urllib.request.Request(
+        asset["browser_download_url"],
+        headers={"User-Agent": "AutoFCO-Updater"},
+    )
+    digest = hashlib.sha256()
+    with urllib.request.urlopen(request, timeout=30) as response:
+        with open(destination, "wb") as output:
+            while True:
+                chunk = response.read(1024 * 1024)
+                if not chunk:
+                    break
+                output.write(chunk)
+                digest.update(chunk)
+
+    expected_digest = asset.get("digest")
+    if expected_digest:
+        if expected_digest.startswith("sha256:"):
+            expected_digest = expected_digest[len("sha256:"):]
+    else:
+        checksum_asset = asset.get("_checksum_asset")
+        if checksum_asset is None:
+            raise ValueError(
+                "Release thiếu SHA-256 cho AutoFCO.exe."
+            )
+        checksum_request = urllib.request.Request(
+            checksum_asset["browser_download_url"],
+            headers={"User-Agent": "AutoFCO-Updater"},
+        )
+        with urllib.request.urlopen(checksum_request, timeout=15) as response:
+            checksum_text = response.read(4096).decode("utf-8-sig")
+        checksum_parts = checksum_text.strip().split()
+        if not checksum_parts:
+            raise ValueError("File SHA-256 trong release đang rỗng.")
+        expected_digest = checksum_parts[0]
+
+    if not re.fullmatch(r"[0-9a-fA-F]{64}", expected_digest):
+        raise ValueError("SHA-256 trong release không hợp lệ.")
+    if digest.hexdigest().lower() != expected_digest.lower():
+        raise ValueError("SHA-256 của file cập nhật không khớp.")
+
+
+def _is_automation_active():
+    return (
+        is_running
+        or upgrade_is_running
+        or (
+            player_insert_thread is not None
+            and player_insert_thread.is_alive()
+        )
+    )
+
+
+def _show_update_prompt(release):
+    global update_installing
+
+    if _is_automation_active():
+        add_log(
+            "ℹ️ Có bản cập nhật mới, nhưng tool đang chạy. "
+            "Hãy dừng quy trình rồi khởi động lại để cập nhật."
+        )
+        return
+
+    version = release["tag_name"]
+    update_url = release["html_url"]
+    if not messagebox.askyesno(
+        "Có bản cập nhật",
+        f"Đã có AUTO FCO {version} (phiên bản hiện tại: "
+        f"v{APP_VERSION}). Bạn muốn tải và cài đặt ngay không?",
+    ):
+        return
+
+    if _is_automation_active():
+        messagebox.showinfo(
+            "Tool đang chạy",
+            "Hãy dừng mọi quy trình đang chạy rồi kiểm tra cập nhật lại.",
+        )
+        return
+
+    update_installing = True
+    add_log(f"⬇️ Đang tải AUTO FCO {version}...")
+    threading.Thread(
+        target=_download_and_install_update,
+        args=(release, update_url),
+        daemon=True,
+    ).start()
+
+
+def _launch_update_installer(downloaded_exe):
+    global update_installing
+
+    target_exe = sys.executable
+    updater_path = os.path.join(
+        _user_data_directory(),
+        "install_update.ps1"
+    )
+    os.makedirs(os.path.dirname(updater_path), exist_ok=True)
+    script = r"""
+param(
+    [int]$ProcessId,
+    [string]$DownloadedExe,
+    [string]$TargetExe
+)
+$ErrorActionPreference = "Stop"
+try {
+    Wait-Process -Id $ProcessId -ErrorAction SilentlyContinue
+    $replacement = "$TargetExe.update"
+    Copy-Item -LiteralPath $DownloadedExe -Destination $replacement -Force
+    if (Test-Path -LiteralPath $TargetExe) {
+        [System.IO.File]::Replace($replacement, $TargetExe, $null)
+    } else {
+        [System.IO.File]::Move($replacement, $TargetExe)
+    }
+    Start-Process -FilePath $TargetExe
+} catch {
+    Add-Type -AssemblyName System.Windows.Forms
+    [System.Windows.Forms.MessageBox]::Show(
+        "Không thể cài đặt bản cập nhật: $($_.Exception.Message)",
+        "AUTO FCO",
+        [System.Windows.Forms.MessageBoxButtons]::OK,
+        [System.Windows.Forms.MessageBoxIcon]::Error
+    ) | Out-Null
+}
+"""
+    try:
+        with open(updater_path, "w", encoding="utf-8-sig") as updater_file:
+            updater_file.write(script)
+
+        subprocess.Popen(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-WindowStyle",
+                "Hidden",
+                "-File",
+                updater_path,
+                "-ProcessId",
+                str(os.getpid()),
+                "-DownloadedExe",
+                downloaded_exe,
+                "-TargetExe",
+                target_exe,
+            ],
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        app.destroy()
+    except OSError as exc:
+        update_installing = False
+        messagebox.showerror(
+            "Không thể cập nhật",
+            f"Không khởi chạy được trình cài đặt cập nhật: {exc}",
+        )
+        add_log(f"❌ Không khởi chạy được trình cài đặt cập nhật: {exc}")
+
+
+def _download_and_install_update(release, update_url):
+    global update_installing
+
+    assets = {
+        asset.get("name"): asset
+        for asset in release.get("assets", [])
+    }
+    executable_asset = assets.get("AutoFCO.exe")
+    if executable_asset is None:
+        update_installing = False
+        app.after(
+            0,
+            lambda: messagebox.showerror(
+                "Không thể cập nhật",
+                f"Release {release['tag_name']} chưa có asset "
+                "AutoFCO.exe. Hãy tải thủ công từ:\n" + update_url,
+            ),
+        )
+        return
+
+    executable_asset["_checksum_asset"] = assets.get("AutoFCO.exe.sha256")
+    update_directory = os.path.join(
+        _user_data_directory(),
+        "updates"
+    )
+    downloaded_exe = os.path.join(update_directory, "AutoFCO-update.exe")
+    try:
+        os.makedirs(update_directory, exist_ok=True)
+        _download_release_asset(executable_asset, downloaded_exe)
+        app.after(
+            0,
+            lambda: _launch_update_installer(downloaded_exe),
+        )
+    except (
+        OSError,
+        urllib.error.URLError,
+        TimeoutError,
+        ValueError,
+        KeyError,
+    ) as exc:
+        update_installing = False
+        if os.path.exists(downloaded_exe):
+            os.remove(downloaded_exe)
+        app.after(
+            0,
+            lambda error=exc: (
+                messagebox.showerror(
+                    "Không thể cập nhật",
+                    f"Tải/cài đặt bản mới thất bại: {error}\n\n"
+                    f"Bạn có thể tải thủ công tại:\n{update_url}",
+                ),
+                add_log(f"❌ Cập nhật thất bại: {error}"),
+            ),
+        )
+
+
+def check_for_updates():
+    if not getattr(sys, "frozen", False):
+        return
+
+    def check_worker():
+        try:
+            release = _github_json(GITHUB_RELEASES_API)
+            latest_version = _release_version(release["tag_name"])
+            current_version = _release_version(APP_VERSION)
+            if latest_version > current_version:
+                app.after(
+                    0,
+                    lambda result=release: _show_update_prompt(result),
+                )
+        except (
+            OSError,
+            urllib.error.URLError,
+            TimeoutError,
+            ValueError,
+            KeyError,
+        ) as exc:
+            add_log(f"⚠️ Không kiểm tra được bản cập nhật: {exc}")
+
+    threading.Thread(target=check_worker, daemon=True).start()
 
 
 def refresh_profile_combo():
@@ -751,6 +1038,10 @@ def start_bot():
     global is_running
     global current_hwnd
     global start_time
+
+    if update_installing:
+        add_log("ℹ️ Đang cập nhật; chưa thể bắt đầu quy trình mới.")
+        return
 
     if is_running:
 
@@ -2391,68 +2682,12 @@ def _save_result_next_debug(screen):
         pass
 
 
-def _save_owned_card_level_debug(screen):
-    height, width = screen.shape[:2]
-    left, top, right, bottom = OWNED_CARD_LEVEL_ROI
-    scale_x = width / 1280
-    scale_y = height / 752
-    x1 = max(0, min(width, int(left * scale_x)))
-    y1 = max(0, min(height, int(top * scale_y)))
-    x2 = max(0, min(width, int(right * scale_x)))
-    y2 = max(0, min(height, int(bottom * scale_y)))
-    roi = screen[y1:y2, x1:x2]
-    if roi.size == 0:
-        raise ValueError(
-            f"Vùng cấp thẻ trống tại pixel ({x1}, {y1}, {x2}, {y2}) "
-            f"trên ảnh {width}x{height}."
-        )
-
-    os.makedirs("ocr_debug", exist_ok=True)
-    stamp = f"{time.strftime('%Y%m%d_%H%M%S')}_{int(time.time() * 1000) % 1000:03d}"
-    full_path = os.path.join(
-        "ocr_debug",
-        f"owned_card_level_screen_{stamp}.png",
-    )
-    roi_path = os.path.join(
-        "ocr_debug",
-        f"owned_card_level_roi_{stamp}.png",
-    )
-    marked_screen = screen.copy()
-    cv2.rectangle(
-        marked_screen,
-        (x1, y1),
-        (x2 - 1, y2 - 1),
-        (0, 0, 255),
-        2,
-    )
-    if not cv2.imwrite(full_path, marked_screen):
-        raise OSError(f"Không lưu được ảnh debug: {full_path}")
-    if not cv2.imwrite(roi_path, roi):
-        raise OSError(f"Không lưu được ảnh debug: {roi_path}")
-    return full_path, roi_path, (x1, y1, x2, y2), (width, height)
-
-
 def _wait_for_owned_card_level(hwnd, timeout=5.0):
     deadline = time.time() + timeout
-    debug_saved = False
     while time.time() < deadline:
         if _upgrade_stop_requested():
             return None
         screen = capture_fco(hwnd)
-        if not debug_saved:
-            debug_saved = True
-            try:
-                full_path, roi_path, pixel_roi, screen_size = (
-                    _save_owned_card_level_debug(screen)
-                )
-                add_log(
-                    "🔎 Vùng dò cấp thẻ: "
-                    f"tọa độ chuẩn {OWNED_CARD_LEVEL_ROI}, "
-                    f"pixel {pixel_roi}, ảnh {screen_size[0]}x{screen_size[1]}. "
-                    f"Ảnh khoanh vùng: {full_path}; ảnh crop: {roi_path}."
-                )
-            except (OSError, ValueError) as exc:
-                add_log(f"⚠️ Không lưu được ảnh debug cấp thẻ: {exc}")
         level = _read_owned_card_level(screen)
         if level is not None:
             return level
@@ -2979,7 +3214,10 @@ def open_upgrade():
         log_upgrade("📂 Đã tải profile Đập cầu thủ.")
 
     def start_upgrade():
-        global upgrade_stop_event
+        global upgrade_stop_event, upgrade_is_running
+        if update_installing:
+            log_upgrade("ℹ️ Đang cập nhật; chưa thể bắt đầu quy trình mới.")
+            return
         if upgrade_stop_event is not None and not upgrade_stop_event.is_set():
             log_upgrade("⚠️ Luồng đập cầu thủ đang chạy.")
             return
@@ -3447,6 +3685,7 @@ def open_upgrade():
                 if upgrade_stop_event is not None:
                     upgrade_stop_event.set()
             finally:
+                upgrade_is_running = False
                 app.after(
                     0,
                     lambda: upgrade_start_button.configure(state="normal"),
@@ -3454,8 +3693,10 @@ def open_upgrade():
 
         upgrade_start_button.configure(state="disabled")
         try:
+            upgrade_is_running = True
             threading.Thread(target=sort_worker, daemon=True).start()
         except Exception:
+            upgrade_is_running = False
             upgrade_start_button.configure(state="normal")
             raise
 
@@ -3664,6 +3905,9 @@ def open_player_insert():
 
     def start_player_insert():
         global player_insert_thread, player_insert_stop_event
+        if update_installing:
+            log_player("ℹ️ Đang cập nhật; chưa thể bắt đầu quy trình mới.")
+            return
         if player_insert_thread is not None and player_insert_thread.is_alive():
             log_player("⚠️ Player Insert đang chạy.")
             return
@@ -4899,6 +5143,11 @@ app.after(
 app.after(
     1000,
     update_timer
+)
+
+app.after(
+    5000,
+    check_for_updates
 )
 
 

@@ -78,7 +78,11 @@ Trách nhiệm:
 
 - Tạo giao diện CustomTkinter với các panel cấu hình, timer, progress bar, log.
 - Tìm cửa sổ FC Online bằng `find_fc_online()` và theo dõi `current_hwnd`.
-- Quản lý `profiles.json` lưu các cấu hình đã dùng.
+- Quản lý `profiles.json` tại `%LOCALAPPDATA%\AutoFCO` để giữ cấu hình qua
+  các lần khởi động và cập nhật; nếu chưa có file người dùng thì nạp profile
+  mặc định được đóng gói cùng ứng dụng.
+- Kiểm tra GitHub Releases khi chạy bản đóng gói; hỏi người dùng trước khi tải
+  và thay thế executable.
 - Khởi chạy background worker cho Auto Buy hoặc Player Insert.
 - Gửi log và trạng thái về UI bằng `app.after(0, ...)` để tránh lỗi Tkinter thread.
 - Chạy vòng lặp `auto_scan_fc_online()` để tìm lại cửa sổ nếu cần.
@@ -408,11 +412,6 @@ Khi cần kiểm tra, `player_insert.py` lưu hình ảnh vào:
 
 Cơ chế này rất có ích để gỡ lỗi khi OCR sai hoặc layout bị lệch.
 
-Khi luồng Upgrade bắt đầu đọc cấp thẻ sau màn hình kết quả hoặc sau START,
-`app.py` lưu một ảnh toàn màn hình có khoanh đỏ vùng `OWNED_CARD_LEVEL_ROI`
-và ảnh crop tương ứng trong `ocr_debug/`. Log hiển thị tọa độ chuẩn, tọa độ
-pixel theo kích thước ảnh, và đường dẫn hai ảnh này.
-
 ## 9. Threading và an toàn
 
 ### 9.1 Main thread
@@ -474,7 +473,7 @@ Các lỗi chính cần được xử lý:
 
 ### 11.1 Profile
 
-`profiles.json` lưu dữ liệu cấu hình Auto Buy theo tên profile:
+`%LOCALAPPDATA%\AutoFCO\profiles.json` lưu dữ liệu cấu hình Auto Buy theo tên profile:
 
 ```json
 {
@@ -504,7 +503,27 @@ Hệ thống duy trì trạng thái động bằng biến toàn cục trong `app
 - Tất cả module đều phải xử lý `stop_event` và retry an toàn.
 - Khi layout thay đổi, cần cập nhật ROI / template tương ứng thay vì sửa logic nghiệp vụ quá sâu.
 
-## 13. Files liên quan
+## 13. Phát hành và cập nhật
+
+- `APP_VERSION` trong `app.py` phải khớp với tag GitHub Release dạng `vX.Y.Z`.
+- Build executable bằng lệnh PyInstaller ở đầu tài liệu, sau đó tạo SHA-256:
+
+  ```powershell
+  $hash = (Get-FileHash .\dist\AutoFCO.exe -Algorithm SHA256).Hash
+  "$hash  AutoFCO.exe" | Set-Content .\dist\AutoFCO.exe.sha256 -Encoding ascii
+  ```
+
+- Tạo GitHub Release mới và đính kèm đúng hai asset `AutoFCO.exe` và
+  `AutoFCO.exe.sha256`. Ứng dụng kiểm tra `releases/latest`, xác minh SHA-256,
+  rồi dùng tiến trình PowerShell riêng để thay executable sau khi ứng dụng thoát.
+- Người dùng xác nhận cập nhật trong hộp thoại; không bắt đầu cài cập nhật khi
+  Auto Buy, Player Insert hoặc luồng đập cầu thủ đang chạy.
+- Chỉ các bản PyInstaller (`--onefile`) tự kiểm tra cập nhật; chạy từ mã nguồn
+  thì bỏ qua bước này.
+- Bản cũ chưa có updater phải được cài thủ công một lần; sau đó mới tự nhận
+  được các release mới.
+
+## 14. Files liên quan
 
 ```text
 app.py
@@ -516,8 +535,8 @@ auto_buy.py
 player_insert.py
     queue sorting, reset timing, max-price parsing, buy flow, GIF output
 
-profiles.json
-    user profile storage for Auto Buy
+%LOCALAPPDATA%\AutoFCO\profiles.json
+    user profile storage for Auto Buy, persists across releases
 
 templates/
     image models for game UI recognition
@@ -529,7 +548,7 @@ ocr_debug/
     debug screenshots of value reads and click points
 ```
 
-## 14. Checklist kiểm thử
+## 15. Checklist kiểm thử
 
 - [ ] Tìm đúng cửa sổ FC ONLINE khi khởi động.
 - [ ] UI cập nhật log và trạng thái không block bởi worker.
@@ -544,7 +563,6 @@ ocr_debug/
 - [ ] Cấp thẻ sở hữu được OCR tại badge góc dưới trái của thẻ được chọn.
 - [ ] Khi START, cấp thẻ ban đầu được đọc trước lần đập đầu; OCR lỗi thì dừng
       an toàn, cấp đã đạt/vượt mục tiêu thì không đập tiếp.
-- [ ] Khi đọc cấp thẻ, ảnh debug khoanh đúng ROI badge và lưu crop tương ứng.
 - [ ] Nút `Tiếp` được phát hiện ổn định dù vị trí contour dao động nhẹ giữa
       các frame animation.
 - [ ] Sau khi bấm `Tiếp theo`, nếu popup xác nhận nâng cấp xuất hiện thì
