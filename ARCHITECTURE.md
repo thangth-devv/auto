@@ -514,7 +514,8 @@ Hệ thống duy trì trạng thái động bằng biến toàn cục trong `app
   ```
 
 - Tạo GitHub Release mới và đính kèm đúng hai asset `AutoFCO.exe` và
-  `AutoFCO.exe.sha256`. Ứng dụng kiểm tra `releases/latest`, xác minh SHA-256,
+  `AutoFCO.exe.sha256`. Ứng dụng kiểm tra `releases/latest` bằng HTTPS với
+  chứng chỉ tin cậy từ Windows Root Certificate Store, xác minh SHA-256,
   rồi dùng tiến trình PowerShell riêng để thay executable sau khi ứng dụng thoát.
 - Người dùng xác nhận cập nhật trong hộp thoại; không bắt đầu cài cập nhật khi
   Auto Buy, Player Insert hoặc luồng đập cầu thủ đang chạy.

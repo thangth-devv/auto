@@ -10,6 +10,7 @@ import json
 import re
 import unicodedata
 import hashlib
+import ssl
 import subprocess
 import urllib.error
 import urllib.request
@@ -571,6 +572,24 @@ def _release_version(tag_name):
         return tuple(int(part) for part in match.groups())
 
 
+def _https_context():
+    context = ssl.create_default_context()
+    if os.name == "nt" and hasattr(ssl, "enum_certificates"):
+        trusted_roots = (
+            ssl.DER_cert_to_PEM_cert(certificate)
+            for certificate, encoding, trust in ssl.enum_certificates("ROOT")
+            if encoding == "x509_asn"
+            and (
+                trust is True
+                or "1.3.6.1.5.5.7.3.1" in trust
+            )
+        )
+        pem_certificates = "".join(trusted_roots)
+        if pem_certificates:
+            context.load_verify_locations(cadata=pem_certificates)
+    return context
+
+
 def _github_json(url):
     request = urllib.request.Request(
         url,
@@ -580,7 +599,11 @@ def _github_json(url):
             "X-GitHub-Api-Version": "2022-11-28",
         },
     )
-    with urllib.request.urlopen(request, timeout=15) as response:
+    with urllib.request.urlopen(
+        request,
+        timeout=15,
+        context=_https_context(),
+    ) as response:
         return json.loads(response.read().decode("utf-8"))
 
 
@@ -590,7 +613,11 @@ def _download_release_asset(asset, destination):
         headers={"User-Agent": "AutoFCO-Updater"},
     )
     digest = hashlib.sha256()
-    with urllib.request.urlopen(request, timeout=30) as response:
+    with urllib.request.urlopen(
+        request,
+        timeout=30,
+        context=_https_context(),
+    ) as response:
         with open(destination, "wb") as output:
             while True:
                 chunk = response.read(1024 * 1024)
@@ -613,7 +640,11 @@ def _download_release_asset(asset, destination):
             checksum_asset["browser_download_url"],
             headers={"User-Agent": "AutoFCO-Updater"},
         )
-        with urllib.request.urlopen(checksum_request, timeout=15) as response:
+        with urllib.request.urlopen(
+            checksum_request,
+            timeout=15,
+            context=_https_context(),
+        ) as response:
             checksum_text = response.read(4096).decode("utf-8-sig")
         checksum_parts = checksum_text.strip().split()
         if not checksum_parts:
