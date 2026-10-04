@@ -2190,41 +2190,42 @@ def _read_owned_card_level_ocr_badge(screen):
         255,
         cv2.THRESH_BINARY,
     )
-    upscaled = cv2.resize(
-        binary[1],
-        None,
-        fx=8,
-        fy=8,
-        interpolation=cv2.INTER_CUBIC,
-    )
-    padded = cv2.copyMakeBorder(
-        upscaled,
-        20,
-        20,
-        20,
-        20,
-        cv2.BORDER_CONSTANT,
-        value=0,
-    )
-
     candidates = []
-    for psm in (10, 7, 13):
-        try:
-            text = pytesseract.image_to_string(
-                padded,
-                config=(
-                    f"--psm {psm} "
-                    "-c tessedit_char_whitelist=0123456789"
-                ),
-                lang="eng",
+    for scale in (4, 8):
+        upscaled = cv2.resize(
+            binary[1],
+            None,
+            fx=scale,
+            fy=scale,
+            interpolation=cv2.INTER_CUBIC,
+        )
+        for padding_color in (0, 255):
+            padded = cv2.copyMakeBorder(
+                upscaled,
+                scale * 2,
+                scale * 2,
+                scale * 2,
+                scale * 2,
+                cv2.BORDER_CONSTANT,
+                value=padding_color,
             )
-        except Exception:
-            return None
-        digits = "".join(ch for ch in text if ch.isdigit())
-        if len(digits) in (1, 2):
-            value = int(digits)
-            if 1 <= value <= 20:
-                candidates.append(value)
+            for psm in (10, 8, 7, 13):
+                try:
+                    text = pytesseract.image_to_string(
+                        padded,
+                        config=(
+                            f"--psm {psm} "
+                            "-c tessedit_char_whitelist=0123456789"
+                        ),
+                        lang="eng",
+                    )
+                except Exception:
+                    return None
+                digits = "".join(ch for ch in text if ch.isdigit())
+                if len(digits) in (1, 2):
+                    value = int(digits)
+                    if 1 <= value <= 20:
+                        candidates.append(value)
     if not candidates:
         return None
     value, votes = Counter(candidates).most_common(1)[0]

@@ -364,13 +364,13 @@ OCR được dùng để đọc giá, số lượng cầu thủ trong popup mua 
 Detector cấp thẻ chỉ đọc badge ở góc dưới bên trái thẻ cầu thủ đang chọn:
 
 ```python
-OWNED_CARD_LEVEL_ROI = (196, 257, 231, 281)
+OWNED_CARD_LEVEL_ROI = (199, 257, 234, 281)
 ```
 
 ROI tính theo layout tham chiếu `1280x752` và được scale theo ảnh chụp cửa sổ.
-Ảnh được chuyển xám, threshold, phóng to và padding trước khi thử nhiều PSM
-Tesseract; chấp nhận kết quả khi ít nhất hai lần đọc đồng thuận trong khoảng
-cấp hợp lệ.
+Ảnh được chuyển xám, threshold, phóng to theo nhiều tỷ lệ và padding nền
+đen/trắng trước khi thử nhiều PSM Tesseract (`10`, `8`, `7`, `13`); chấp nhận
+kết quả khi ít nhất hai lần đọc đồng thuận trong khoảng cấp hợp lệ.
 
 ### 7.3 OCR cho giá
 
